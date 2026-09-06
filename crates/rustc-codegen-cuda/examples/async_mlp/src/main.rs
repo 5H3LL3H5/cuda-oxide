@@ -35,12 +35,14 @@
 //! Build and run with:
 //!   cargo oxide run async_mlp
 
-use cuda_async::device_box::DeviceBox;
-use cuda_async::device_context::init_device_contexts;
-use cuda_async::device_operation::{self, DeviceOperation, Zippable, value};
+use cuda_async::simt::device_box::DeviceBox;
+use cuda_async::simt::device_context::init_device_contexts;
+use cuda_async::simt::device_operation::{self, DeviceOperation, Zippable, value};
 use cuda_async::zip;
-use cuda_core::LaunchConfig;
-use cuda_core::memory::{malloc_async, memcpy_dtoh_async, memcpy_htod_async, memset_d8_async};
+use cuda_core::simt::LaunchConfig;
+use cuda_core::simt::memory::{
+    malloc_async, memcpy_dtoh_async, memcpy_htod_async, memset_d8_async,
+};
 use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_module;
 use std::future::IntoFuture;
@@ -71,7 +73,8 @@ mod kernels {
         let row = thread::index_2d_row();
         let col = thread::index_2d_col();
 
-        if let Some(c_idx) = unsafe { thread::index_2d_runtime(n as usize) } {
+        // The row width comes from `c`, bound on the host to this same `n`.
+        if let Some(c_idx) = thread::index_2d_runtime(&c) {
             // col < n guaranteed by index_2d_runtime returning Some
             if row < m as usize {
                 let n_sz = n as usize;
@@ -264,14 +267,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     DeviceBox<[f32]>,
                     DeviceBox<[f32]>,
                 )| {
-                    let launch = module
-                        .sgemm_naive_async_owned(
-                            gemm_cfg, DIM as u32, DIM as u32, DIM as u32, 1.0f32, input, w0,
-                            0.0f32, hidden,
+                    // SAFETY: the 2D grid and block match `sgemm_naive`'s
+                    // indexing, and all matrices are DIM x DIM allocations.
+                    let launch = unsafe {
+                        module.sgemm_naive_async_owned(
+                            gemm_cfg,
+                            DIM as u32,
+                            DIM as u32,
+                            DIM as u32,
+                            1.0f32,
+                            input,
+                            w0,
+                            0.0f32,
+                            // C's row width, bound to the buffer for this launch.
+                            cuda_host::RowWidthOwned::new(hidden, DIM as u32),
                         )
-                        .expect("Failed to build sgemm_naive launch");
-                    launch
-                        .and_then(move |(_input, _w0, hidden)| value((hidden, output, w1, module)))
+                    }
+                    .expect("Failed to build sgemm_naive launch");
+                    launch.and_then(move |(_input, _w0, hidden)| {
+                        value((hidden.into_buffer(), output, w1, module))
+                    })
                 },
             )
             // ── Stage 2: MatVec  output = hidden @ W1 ───────────────────
@@ -282,19 +297,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Arc<DeviceBox<[f32]>>,
                     kernels::LoadedModule,
                 )| {
-                    let launch = module
-                        .matvec_naive_async_owned(
+                    // SAFETY: this is a 1D launch of DIM guarded threads over
+                    // DIM-sized vectors and a DIM x DIM matrix.
+                    let launch = unsafe {
+                        module.matvec_naive_async_owned(
                             matvec_cfg, DIM as u32, DIM as u32, hidden, w1, output,
                         )
-                        .expect("Failed to build matvec_naive launch");
+                    }
+                    .expect("Failed to build matvec_naive launch");
                     launch.and_then(move |(_hidden, _w1, output)| value((output, module)))
                 },
             )
             // ── Stage 3: ReLU  result = max(0, output) ──────────────────
             .and_then(
                 move |(output, module): (DeviceBox<[f32]>, kernels::LoadedModule)| {
-                    module
-                        .relu_async_owned(relu_cfg, output)
+                    // SAFETY: this is a 1D launch and the ReLU kernel guards
+                    // accesses using the owned output's DIM-element length.
+                    unsafe { module.relu_async_owned(relu_cfg, output) }
                         .expect("Failed to build relu launch")
                 },
             )

@@ -15,7 +15,8 @@
 //! Build and run with:
 //!   cargo oxide run tiled_gemm
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::simt::LaunchConfig;
+use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 use cuda_host::cuda_module;
 use std::time::Instant;
@@ -112,7 +113,8 @@ mod kernels {
         }
 
         // Write result to global memory
-        if let Some(c_idx) = unsafe { thread::index_2d_runtime(n_size) } {
+        // The row width comes from `c`, bound on the host to this same `n`.
+        if let Some(c_idx) = thread::index_2d_runtime(&c) {
             // col < n_size guaranteed by index_2d_runtime returning Some
             if row < m_size
                 && let Some(c_elem) = c.get_mut(c_idx)
@@ -163,11 +165,7 @@ fn main() {
     let b_dev = DeviceBuffer::from_host(&stream, &b).unwrap();
     let mut c_dev = DeviceBuffer::from_host(&stream, &c).unwrap();
 
-    let module = ctx
-        .load_module_from_file("tiled_gemm.ptx")
-        .expect("Failed to load PTX module");
-    let module = kernels::from_module(module).expect("Failed to initialize typed CUDA module");
-
+    let module = kernels::load(&ctx).expect("Failed to load embedded CUDA module");
     // Configure launch: 16x16 threads per block (matches TILE_SIZE)
     let block_size = 16u32;
     let grid_x = (N as u32).div_ceil(block_size);
@@ -192,8 +190,9 @@ fn main() {
 
     // Warmup
     println!("\nWarmup...");
-    module
-        .sgemm_tiled(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.sgemm_tiled(
             (stream).as_ref(),
             cfg,
             m_arg,
@@ -203,9 +202,10 @@ fn main() {
             &a_dev,
             &b_dev,
             BETA,
-            &mut c_dev,
+            cuda_host::RowWidth::new(&mut c_dev, n_arg),
         )
-        .unwrap();
+    }
+    .unwrap();
     stream.synchronize().unwrap();
 
     // Timed runs
@@ -213,8 +213,9 @@ fn main() {
     println!("Running {} iterations...", NUM_RUNS);
     let start = Instant::now();
     for _ in 0..NUM_RUNS {
-        module
-            .sgemm_tiled(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.sgemm_tiled(
                 (stream).as_ref(),
                 cfg,
                 m_arg,
@@ -224,9 +225,10 @@ fn main() {
                 &a_dev,
                 &b_dev,
                 BETA,
-                &mut c_dev,
+                cuda_host::RowWidth::new(&mut c_dev, n_arg),
             )
-            .unwrap();
+        }
+        .unwrap();
     }
     stream.synchronize().unwrap();
     let elapsed = start.elapsed();

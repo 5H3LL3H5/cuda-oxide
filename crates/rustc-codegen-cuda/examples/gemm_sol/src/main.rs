@@ -36,23 +36,28 @@
 //! Build and run with:
 //!   cargo oxide run gemm_sol
 
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
+use cuda_core::simt::LaunchConfig;
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::barrier::{
-    Barrier, fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_cluster,
-    mbarrier_arrive_expect_tx, mbarrier_init, mbarrier_inval, mbarrier_try_wait_parity,
+    Barrier, fence_mbarrier_init_release_cluster,
+    fence_proxy_async_generic_acquire_shared_cluster_cluster,
+    fence_proxy_async_generic_release_shared_cta_cluster, fence_proxy_async_shared_cta,
+    mbarrier_arrive, mbarrier_arrive_cluster, mbarrier_arrive_expect_tx,
+    mbarrier_arrive_expect_tx_cluster, mbarrier_init, mbarrier_inval, mbarrier_try_wait_parity,
+    mbarrier_try_wait_parity_cluster,
 };
 use cuda_device::clc::{
     clc_query_get_first_ctaid_x, clc_query_is_canceled, clc_try_cancel, clc_try_cancel_multicast,
 };
 use cuda_device::cluster;
-use cuda_device::shared::SharedArray;
+use cuda_device::convert::{bf16_to_f32, cvt_bf16x2_f32};
+use cuda_device::shared::{SharedArray, cvta_generic_to_shared_offset};
 use cuda_device::tcgen05::{
     Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
-    cvt_f32x2_bf16x2, stmatrix_m8n8_x2, tcgen05_alloc, tcgen05_alloc_cg2,
-    tcgen05_commit_multicast_cg2, tcgen05_commit_shared_cluster, tcgen05_dealloc,
-    tcgen05_dealloc_cg2, tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_mma_f16,
-    tcgen05_mma_f16_cg2, tcgen05_relinquish_alloc_permit_cg2,
+    stmatrix_m8n8_x2, tcgen05_alloc, tcgen05_alloc_cg2, tcgen05_commit_multicast_cg2,
+    tcgen05_commit_shared_cluster, tcgen05_dealloc, tcgen05_dealloc_cg2, tcgen05_ld_16x256b_pure,
+    tcgen05_load_wait, tcgen05_mma_f16, tcgen05_mma_f16_cg2, tcgen05_relinquish_alloc_permit_cg2,
 };
 use cuda_device::tma::{
     TmaDescriptor, cp_async_bulk_tensor_2d_g2s, cp_async_bulk_tensor_2d_g2s_multicast,
@@ -60,9 +65,151 @@ use cuda_device::tma::{
 };
 use cuda_device::{DisjointSlice, cluster_launch, kernel, thread, warp};
 use cuda_host::cuda_module;
-use half::f16;
+use half::{bf16, f16};
 use std::mem::MaybeUninit;
 use std::sync::Arc;
+
+// =============================================================================
+// LIVE cuBLASLt BASELINE (replaces the previous hardcoded B200 constants)
+// =============================================================================
+
+/// Live cublasLt FP16 GEMM baseline used to compute "% of SoL" in benchmark
+/// reports.
+///
+/// The baseline is measured by `bench/cublaslt_bench` (a tiny C program that
+/// calls `cublasLtMatmul` with the same shapes/dtypes gemm_sol uses). On
+/// first access we invoke that binary, parse the FP16 section of its output,
+/// and cache the result. If the binary is missing or fails, the per-phase
+/// reports omit the "% of SoL" column rather than printing a misleading
+/// number against a baseline measured on different silicon.
+mod cublas_baseline {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    static BASELINE: OnceLock<Option<HashMap<usize, f64>>> = OnceLock::new();
+
+    /// FP16-input / FP32-compute cublasLtMatmul TFLOPS for an M×M×M GEMM on
+    /// the host GPU, or `None` if the bench could not be measured.
+    pub fn fp16_tflops(m: usize) -> Option<f64> {
+        BASELINE.get_or_init(load).as_ref()?.get(&m).copied()
+    }
+
+    /// Pre-warm the baseline so the ~25s measurement runs at startup, not in
+    /// the middle of a benchmark print.
+    pub fn warmup() {
+        let _ = BASELINE.get_or_init(load);
+    }
+
+    fn bench_binary() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("bench")
+            .join("cublaslt_bench")
+    }
+
+    fn load() -> Option<HashMap<usize, f64>> {
+        let bin = bench_binary();
+        if !bin.exists() {
+            eprintln!(
+                "ℹ️  No live cublasLt baseline at {} — % of SoL column will be omitted.",
+                bin.display()
+            );
+            eprintln!(
+                "    Build it once with: cd {} && bash build.sh",
+                bin.parent().unwrap_or(Path::new(".")).display(),
+            );
+            return None;
+        }
+
+        eprintln!("ℹ️  Measuring cublasLt FP16 baseline on host GPU (one-shot, ~25s)...");
+        let out = match std::process::Command::new(&bin).output() {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("⚠️  Failed to run {}: {e}", bin.display());
+                return None;
+            }
+        };
+        if !out.status.success() {
+            eprintln!(
+                "⚠️  {} exited with status {}: {}",
+                bin.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let map = parse_fp16(&stdout);
+        if map.is_empty() {
+            eprintln!("⚠️  Could not parse FP16 rows from cublaslt_bench output:\n{stdout}");
+            None
+        } else {
+            let mut sizes: Vec<(usize, f64)> = map.iter().map(|(m, t)| (*m, *t)).collect();
+            sizes.sort_by_key(|(m, _)| *m);
+            let pretty = sizes
+                .iter()
+                .map(|(m, t)| format!("{m}={:.1}", t))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("✓ cublasLt FP16 baseline (TFLOPS): {pretty}");
+            Some(map)
+        }
+    }
+
+    /// Extract `(M, TFLOPS)` pairs from the `--- FP16 ---` section of
+    /// `cublaslt_bench` output. Lines look like:
+    ///
+    /// ```text
+    /// FP16 FP32 compute   16384x16384x16384   20.5993 ms     427.0 TFLOPS
+    /// ```
+    fn parse_fp16(s: &str) -> HashMap<usize, f64> {
+        let mut map = HashMap::new();
+        let mut in_fp16 = false;
+        for line in s.lines() {
+            let l = line.trim_start();
+            if l.starts_with("--- FP16") {
+                in_fp16 = true;
+                continue;
+            }
+            if l.starts_with("--- BF16") {
+                in_fp16 = false;
+                continue;
+            }
+            if !in_fp16 || !l.starts_with("FP16 ") {
+                continue;
+            }
+            // ["FP16", "FP32", "compute", "MxNxK", "X.XXXX", "ms", "Y.Y", "TFLOPS"]
+            let toks: Vec<&str> = l.split_whitespace().collect();
+            let size = toks.get(3).copied().unwrap_or("");
+            let m: Option<usize> = size.split('x').next().and_then(|s| s.trim().parse().ok());
+            // TFLOPS value is the second-to-last token (last is the literal "TFLOPS")
+            let tf: Option<f64> = toks.iter().rev().nth(1).and_then(|s| s.parse().ok());
+            if let (Some(m), Some(tf)) = (m, tf) {
+                map.insert(m, tf);
+            }
+        }
+        map
+    }
+}
+
+/// Print the "vs cuBLAS" line for a benchmark phase, using the live baseline
+/// from `bench/cublaslt_bench` if available, otherwise an explanatory
+/// placeholder. Replaces the previous hardcoded `match m { ... }` blocks
+/// that compared every host GPU against B200's cublasLt SoL.
+fn print_cublas_comparison(tflops: f64, m: usize) {
+    match cublas_baseline::fp16_tflops(m) {
+        Some(sol) => {
+            let pct = (tflops / sol) * 100.0;
+            println!(
+                "  vs cuBLAS:   {:.2}% of live cublasLt SoL ({:.0} TFLOPS)",
+                pct, sol
+            );
+        }
+        None => {
+            println!("  vs cuBLAS:   (no live cublasLt baseline; see bench/build.sh)");
+        }
+    }
+}
 
 // =============================================================================
 // KERNEL
@@ -275,8 +422,8 @@ mod kernels {
                 //   j=2: K-groups 4,5 (K=32..47)  — base offset =  8192
                 //   j=3: K-groups 6,7 (K=48..63)  — base offset = 12288
                 if is_thread0 {
-                    let smem_a_base = &raw const SMEM_A as u64;
-                    let smem_b_base = &raw const SMEM_B as u64;
+                    let smem_a_base = cvta_generic_to_shared_offset(&raw const SMEM_A as *const u8);
+                    let smem_b_base = cvta_generic_to_shared_offset(&raw const SMEM_B as *const u8);
 
                     let mut j: u32 = 0;
                     while j < 4 {
@@ -332,7 +479,7 @@ mod kernels {
             //   lane_id % 8  → which row within an 8-row group (0..7)
             //   lanes  0..7  → first  8×8 matrix (col_offset + 0..7)
             //   lanes  8..15 → second 8×8 matrix (col_offset + 8..15), offset by 16 bytes
-            //   lanes 16..31 → don't participate in stmatrix (hardware ignores them)
+            //   lanes 16..31 → address operand ignored; fragment registers still participate
             const TILE_N: usize = 128;
             let warp_row_base = (warp_id * 32) as usize;
             let row_stride_bytes = TILE_N * 2; // 128 bf16 = 256 bytes per row
@@ -360,8 +507,8 @@ mod kernels {
                     tcgen05_load_wait();
 
                     // Convert f32 pairs → packed bf16 pairs, write via stmatrix
-                    let p0_lo = cvt_f32x2_bf16x2(regs_a[0], regs_a[1]);
-                    let p1_lo = cvt_f32x2_bf16x2(regs_b[0], regs_b[1]);
+                    let p0_lo = cvt_bf16x2_f32(regs_a[0], regs_a[1]);
+                    let p1_lo = cvt_bf16x2_f32(regs_b[0], regs_b[1]);
 
                     let out_row_lo = warp_row_base + (tmem_row_block as usize * 16) + row_within_8;
                     let smem_addr_lo = (&raw mut SMEM_OUT as *mut u8).add(
@@ -370,8 +517,8 @@ mod kernels {
                     stmatrix_m8n8_x2(smem_addr_lo, p0_lo, p1_lo);
 
                     // Same for the upper 8 rows of this 16-row block
-                    let p0_hi = cvt_f32x2_bf16x2(regs_a[2], regs_a[3]);
-                    let p1_hi = cvt_f32x2_bf16x2(regs_b[2], regs_b[3]);
+                    let p0_hi = cvt_bf16x2_f32(regs_a[2], regs_a[3]);
+                    let p1_hi = cvt_bf16x2_f32(regs_b[2], regs_b[3]);
 
                     let out_row_hi =
                         warp_row_base + (tmem_row_block as usize * 16) + 8 + row_within_8;
@@ -547,8 +694,8 @@ mod kernels {
                 //   j=2: byte offset 64 (K=32..47)
                 //   j=3: byte offset 96 (K=48..63)
                 if is_thread0 {
-                    let smem_a_base = &raw const SMEM_A as u64;
-                    let smem_b_base = &raw const SMEM_B as u64;
+                    let smem_a_base = cvta_generic_to_shared_offset(&raw const SMEM_A as *const u8);
+                    let smem_b_base = cvta_generic_to_shared_offset(&raw const SMEM_B as *const u8);
 
                     let mut j: u32 = 0;
                     while j < 4 {
@@ -606,8 +753,8 @@ mod kernels {
                     );
                     tcgen05_load_wait();
 
-                    let p0_lo = cvt_f32x2_bf16x2(regs_a[0], regs_a[1]);
-                    let p1_lo = cvt_f32x2_bf16x2(regs_b[0], regs_b[1]);
+                    let p0_lo = cvt_bf16x2_f32(regs_a[0], regs_a[1]);
+                    let p1_lo = cvt_bf16x2_f32(regs_b[0], regs_b[1]);
 
                     let out_row_lo = warp_row_base + (tmem_row_block as usize * 16) + row_within_8;
                     let smem_addr_lo = (&raw mut SMEM_OUT as *mut u8).add(
@@ -615,8 +762,8 @@ mod kernels {
                     );
                     stmatrix_m8n8_x2(smem_addr_lo, p0_lo, p1_lo);
 
-                    let p0_hi = cvt_f32x2_bf16x2(regs_a[2], regs_a[3]);
-                    let p1_hi = cvt_f32x2_bf16x2(regs_b[2], regs_b[3]);
+                    let p0_hi = cvt_bf16x2_f32(regs_a[2], regs_a[3]);
+                    let p1_hi = cvt_bf16x2_f32(regs_b[2], regs_b[3]);
 
                     let out_row_hi =
                         warp_row_base + (tmem_row_block as usize * 16) + 8 + row_within_8;
@@ -804,14 +951,14 @@ mod kernels {
                 // Step 2: Issue MMA on current buffer (async → tensor core)
                 if is_thread0 {
                     let smem_a_base = if buf == 0 {
-                        &raw const SMEM_A0 as u64
+                        cvta_generic_to_shared_offset(&raw const SMEM_A0 as *const u8)
                     } else {
-                        &raw const SMEM_A1 as u64
+                        cvta_generic_to_shared_offset(&raw const SMEM_A1 as *const u8)
                     };
                     let smem_b_base = if buf == 0 {
-                        &raw const SMEM_B0 as u64
+                        cvta_generic_to_shared_offset(&raw const SMEM_B0 as *const u8)
                     } else {
-                        &raw const SMEM_B1 as u64
+                        cvta_generic_to_shared_offset(&raw const SMEM_B1 as *const u8)
                     };
 
                     let mut j: u32 = 0;
@@ -917,8 +1064,8 @@ mod kernels {
                     );
                     tcgen05_load_wait();
 
-                    let p0_lo = cvt_f32x2_bf16x2(regs_a[0], regs_a[1]);
-                    let p1_lo = cvt_f32x2_bf16x2(regs_b[0], regs_b[1]);
+                    let p0_lo = cvt_bf16x2_f32(regs_a[0], regs_a[1]);
+                    let p1_lo = cvt_bf16x2_f32(regs_b[0], regs_b[1]);
 
                     let out_row_lo = warp_row_base + (tmem_row_block as usize * 16) + row_within_8;
                     let smem_addr_lo = (&raw mut SMEM_OUT as *mut u8).add(
@@ -926,8 +1073,8 @@ mod kernels {
                     );
                     stmatrix_m8n8_x2(smem_addr_lo, p0_lo, p1_lo);
 
-                    let p0_hi = cvt_f32x2_bf16x2(regs_a[2], regs_a[3]);
-                    let p1_hi = cvt_f32x2_bf16x2(regs_b[2], regs_b[3]);
+                    let p0_hi = cvt_bf16x2_f32(regs_a[2], regs_a[3]);
+                    let p1_hi = cvt_bf16x2_f32(regs_b[2], regs_b[3]);
 
                     let out_row_hi =
                         warp_row_base + (tmem_row_block as usize * 16) + 8 + row_within_8;
@@ -1181,14 +1328,14 @@ mod kernels {
                     // Issue 4 MMAs on this buffer
                     if is_lane0 {
                         let smem_a_base = if stage == 0 {
-                            &raw const SMEM_A0 as u64
+                            cvta_generic_to_shared_offset(&raw const SMEM_A0 as *const u8)
                         } else {
-                            &raw const SMEM_A1 as u64
+                            cvta_generic_to_shared_offset(&raw const SMEM_A1 as *const u8)
                         };
                         let smem_b_base = if stage == 0 {
-                            &raw const SMEM_B0 as u64
+                            cvta_generic_to_shared_offset(&raw const SMEM_B0 as *const u8)
                         } else {
-                            &raw const SMEM_B1 as u64
+                            cvta_generic_to_shared_offset(&raw const SMEM_B1 as *const u8)
                         };
 
                         let mut j: u32 = 0;
@@ -1260,8 +1407,8 @@ mod kernels {
                         );
                         tcgen05_load_wait();
 
-                        let p0_lo = cvt_f32x2_bf16x2(regs_a[0], regs_a[1]);
-                        let p1_lo = cvt_f32x2_bf16x2(regs_b[0], regs_b[1]);
+                        let p0_lo = cvt_bf16x2_f32(regs_a[0], regs_a[1]);
+                        let p1_lo = cvt_bf16x2_f32(regs_b[0], regs_b[1]);
 
                         let out_row_lo =
                             warp_row_base + (tmem_row_block as usize * 16) + row_within_8;
@@ -1270,8 +1417,8 @@ mod kernels {
                         );
                         stmatrix_m8n8_x2(smem_addr_lo, p0_lo, p1_lo);
 
-                        let p0_hi = cvt_f32x2_bf16x2(regs_a[2], regs_a[3]);
-                        let p1_hi = cvt_f32x2_bf16x2(regs_b[2], regs_b[3]);
+                        let p0_hi = cvt_bf16x2_f32(regs_a[2], regs_a[3]);
+                        let p1_hi = cvt_bf16x2_f32(regs_b[2], regs_b[3]);
 
                         let out_row_hi =
                             warp_row_base + (tmem_row_block as usize * 16) + 8 + row_within_8;
@@ -1395,6 +1542,9 @@ mod kernels {
 
             // TMA → MMA+epilogue: "tile coords are ready in TILE_INFO"
             static mut TILE_READY: Barrier = Barrier::UNINIT;
+            // The producer must not overwrite TILE_INFO until every reader warp
+            // has copied the current tile coordinates/has_work flag.
+            static mut TILE_INFO_FREE: Barrier = Barrier::UNINIT;
 
             const A_TILE_BYTES: u32 = 128 * 64 * 2;
             const B_TILE_BYTES: u32 = 128 * 64 * 2;
@@ -1427,6 +1577,9 @@ mod kernels {
                 mbarrier_init(&raw mut ACCUM_EMPTY0, 128);
                 mbarrier_init(&raw mut ACCUM_EMPTY1, 128);
                 mbarrier_init(&raw mut TILE_READY, 1);
+                // One synchronized leader per reader warp acknowledges that all
+                // lanes have copied the mailbox before the producer reuses it.
+                mbarrier_init(&raw mut TILE_INFO_FREE, 5);
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
@@ -1470,10 +1623,21 @@ mod kernels {
                 // parity = (global_k >> 1) & 1. If we reset per tile, parity would
                 // collide with the previous tile's last iteration.
                 let mut global_k: u32 = 0;
+                let mut tile_seq: u32 = 0;
+                let mut tile_info_free_parity: u32 = 0;
 
                 loop {
                     if is_lane0 {
                         let tile_id = counter.fetch_add(1, AtomicOrdering::Relaxed);
+                        // tile_seq counts prior publishes: the first one has no
+                        // readers to wait for, every later one does.
+                        if tile_seq > 0 {
+                            while !mbarrier_try_wait_parity(
+                                &raw const TILE_INFO_FREE,
+                                tile_info_free_parity,
+                            ) {}
+                            tile_info_free_parity ^= 1;
+                        }
                         if tile_id < total_tiles {
                             *(&raw mut TILE_INFO as *mut u32).add(0) = tile_id / tiles_n;
                             *(&raw mut TILE_INFO as *mut u32).add(1) = tile_id % tiles_n;
@@ -1482,8 +1646,13 @@ mod kernels {
                             *(&raw mut TILE_INFO as *mut u32).add(2) = 0;
                         }
                         mbarrier_arrive(&raw const TILE_READY);
+                        tile_seq += 1;
                     }
 
+                    // Lanes 1-31 read the mailbox lane 0 just wrote, and lane 0
+                    // can stall above waiting for reader acks; without this sync
+                    // they race ahead and can read the previous tile's has_work.
+                    warp::sync_mask(u32::MAX);
                     let has_work = *(&raw const TILE_INFO as *const u32).add(2);
                     if has_work == 0 {
                         break;
@@ -1504,6 +1673,10 @@ mod kernels {
                         } else {
                             while !mbarrier_try_wait_parity(&raw const MMA_BAR1, mma_parity) {}
                         }
+                        // All lanes wait, then sync before lane 0 issues the
+                        // loads that let MMA re-arm this barrier (same
+                        // no-stranding rule as the MMA warp's K-loop).
+                        warp::sync_mask(u32::MAX);
 
                         if is_lane0 {
                             let k_base = (k_idx * 64) as i32;
@@ -1579,6 +1752,10 @@ mod kernels {
                     tile_parity ^= 1;
 
                     let has_work = *(&raw const TILE_INFO as *const u32).add(2);
+                    warp::sync_mask(u32::MAX);
+                    if is_lane0 {
+                        mbarrier_arrive(&raw const TILE_INFO_FREE);
+                    }
                     if has_work == 0 {
                         break;
                     }
@@ -1587,6 +1764,10 @@ mod kernels {
                     let tmem_stage_offset = accum_stage * ACCUM_STAGE_COLS;
 
                     // First 2 tiles fill fresh stages; after that, wait for epilogue to drain
+                    // All lanes may wait here: the next ACCUM_EMPTY phase needs
+                    // an ACCUM_FULL commit from a later tile, which sits behind
+                    // this warp's tile-top sync, so the barrier cannot advance
+                    // past a lane that is still waiting on it.
                     if tile_iter >= NUM_ACCUM_STAGES {
                         let empty_parity = ((tile_iter - NUM_ACCUM_STAGES) / NUM_ACCUM_STAGES) & 1;
                         if accum_stage == 0 {
@@ -1609,17 +1790,24 @@ mod kernels {
                         } else {
                             while !mbarrier_try_wait_parity(&raw const TMA_BAR1, tma_parity) {}
                         }
+                        // All lanes wait, then sync before lane 0 consumes the
+                        // stage. The commit below is what lets the producer
+                        // re-arm this barrier, so ordering it after the sync
+                        // means the barrier can never advance past a lane that
+                        // is still waiting on it -- no lane can strand one
+                        // parity short of a stopped barrier.
+                        warp::sync_mask(u32::MAX);
 
                         if is_lane0 {
                             let smem_a_base = if stage == 0 {
-                                &raw const SMEM_A0 as u64
+                                cvta_generic_to_shared_offset(&raw const SMEM_A0 as *const u8)
                             } else {
-                                &raw const SMEM_A1 as u64
+                                cvta_generic_to_shared_offset(&raw const SMEM_A1 as *const u8)
                             };
                             let smem_b_base = if stage == 0 {
-                                &raw const SMEM_B0 as u64
+                                cvta_generic_to_shared_offset(&raw const SMEM_B0 as *const u8)
                             } else {
-                                &raw const SMEM_B1 as u64
+                                cvta_generic_to_shared_offset(&raw const SMEM_B1 as *const u8)
                             };
 
                             let mut j: u32 = 0;
@@ -1679,6 +1867,7 @@ mod kernels {
             // All 128 threads arrive on ACCUM_EMPTY to signal MMA that TMEM is free.
             // ════════════════════════════════════════════════════════════════════
             if warp_id < 4 {
+                let is_lane0 = lane_id == 0;
                 let mut epi_tile_iter: u32 = 0;
                 let mut tile_parity: u32 = 0;
 
@@ -1694,13 +1883,16 @@ mod kernels {
                     tile_parity ^= 1;
 
                     let has_work = *(&raw const TILE_INFO as *const u32).add(2);
-                    if has_work == 0 {
-                        break;
-                    }
-
                     // Save tile coords to local regs (TILE_INFO may be overwritten by TMA later)
                     let tile_m = *(&raw const TILE_INFO as *const u32).add(0);
                     let tile_n = *(&raw const TILE_INFO as *const u32).add(1);
+                    warp::sync_mask(u32::MAX);
+                    if is_lane0 {
+                        mbarrier_arrive(&raw const TILE_INFO_FREE);
+                    }
+                    if has_work == 0 {
+                        break;
+                    }
 
                     let accum_stage = epi_tile_iter % NUM_ACCUM_STAGES;
                     let tmem_stage_offset = accum_stage * ACCUM_STAGE_COLS;
@@ -1739,8 +1931,8 @@ mod kernels {
                             );
                             tcgen05_load_wait();
 
-                            let p0_lo = cvt_f32x2_bf16x2(regs_a[0], regs_a[1]);
-                            let p1_lo = cvt_f32x2_bf16x2(regs_b[0], regs_b[1]);
+                            let p0_lo = cvt_bf16x2_f32(regs_a[0], regs_a[1]);
+                            let p1_lo = cvt_bf16x2_f32(regs_b[0], regs_b[1]);
                             let out_row_lo =
                                 warp_row_base + (tmem_row_block as usize * 16) + row_within_8;
                             let smem_addr_lo = (&raw mut SMEM_OUT as *mut u8).add(
@@ -1750,8 +1942,8 @@ mod kernels {
                             );
                             stmatrix_m8n8_x2(smem_addr_lo, p0_lo, p1_lo);
 
-                            let p0_hi = cvt_f32x2_bf16x2(regs_a[2], regs_a[3]);
-                            let p1_hi = cvt_f32x2_bf16x2(regs_b[2], regs_b[3]);
+                            let p0_hi = cvt_bf16x2_f32(regs_a[2], regs_a[3]);
+                            let p1_hi = cvt_bf16x2_f32(regs_b[2], regs_b[3]);
                             let out_row_hi =
                                 warp_row_base + (tmem_row_block as usize * 16) + 8 + row_within_8;
                             let smem_addr_hi = (&raw mut SMEM_OUT as *mut u8).add(
@@ -1811,6 +2003,7 @@ mod kernels {
                 mbarrier_inval(&raw mut ACCUM_EMPTY0);
                 mbarrier_inval(&raw mut ACCUM_EMPTY1);
                 mbarrier_inval(&raw mut TILE_READY);
+                mbarrier_inval(&raw mut TILE_INFO_FREE);
             }
         }
     }
@@ -1828,9 +2021,10 @@ mod kernels {
     ///   │    (blockIdx.x)       │      │ [CTA8..CTA11]       │
     ///   │                       │      │ [CTA12..CTA15]      │
     ///   │ 2. CLC work-stealing: │      │ ...                 │
-    ///   │    arrive_expect_tx   │      │                     │
+    ///   │    lane 0: arm + issue│      │                     │
     ///   │    clc_try_cancel ────┼─────▶│ steal [CTA4..CTA7]  │
-    ///   │    wait CLC_BAR       │      │ (removed from queue)│
+    ///   │    lane 0: wait/decode│      │ (removed from queue)│
+    ///   │    warp: shuffle result│     │                     │
     ///   │                       │      └─────────────────────┘
     ///   │ 3. Process all 4 tiles│
     ///   │    from stolen cluster│      Each CTA independently steals
@@ -1850,6 +2044,8 @@ mod kernels {
     ///   steal pending work via `clc_try_cancel` instead of `atomicAdd` on a global counter.
     /// - **Cluster-aware stealing**: `clc_try_cancel` returns the first ctaid of a stolen
     ///   cluster. Each CTA serially processes all `CLUSTER_SIZE` tiles from that cluster.
+    /// - **Single-lane response ownership**: lane 0 waits for and decodes the async CLC
+    ///   response, then broadcasts the result to its warp so every lane takes the same path.
     /// - **Column-major tile rasterization**: linear ctaid maps to (row, col) for L2 locality.
     /// - **No `tile_counter` parameter**: hardware manages the pending queue, zero contention.
     ///
@@ -1891,6 +2087,9 @@ mod kernels {
             static mut ACCUM_EMPTY1: Barrier = Barrier::UNINIT;
 
             static mut TILE_READY: Barrier = Barrier::UNINIT;
+            // The producer must not overwrite TILE_INFO until every reader warp
+            // has copied the current tile coordinates/has_work flag.
+            static mut TILE_INFO_FREE: Barrier = Barrier::UNINIT;
 
             // CLC: 16-byte response buffer + mbarrier
             static mut CLC_RESPONSE: SharedArray<u64, 2, 16> = SharedArray::UNINIT;
@@ -1925,6 +2124,9 @@ mod kernels {
                 mbarrier_init(&raw mut ACCUM_EMPTY0, 128);
                 mbarrier_init(&raw mut ACCUM_EMPTY1, 128);
                 mbarrier_init(&raw mut TILE_READY, 1);
+                // One synchronized leader per reader warp acknowledges that all
+                // lanes have copied the mailbox before the producer reuses it.
+                mbarrier_init(&raw mut TILE_INFO_FREE, 5);
                 mbarrier_init(&raw mut CLC_BAR, 1);
                 fence_proxy_async_shared_cta();
             }
@@ -1962,6 +2164,7 @@ mod kernels {
                 let is_lane0 = lane_id == 0;
                 let mut global_k: u32 = 0;
                 let mut clc_iter: u32 = 0;
+                let mut tile_info_free_parity: u32 = 0;
 
                 // ── First tile: use our own blockIdx (hardware-assigned) ──
                 let first_ctaid = thread::blockIdx_x();
@@ -1988,10 +2191,18 @@ mod kernels {
                     } else {
                         while !mbarrier_try_wait_parity(&raw const MMA_BAR1, mma_parity) {}
                     }
+                    // All lanes wait, then sync before lane 0 issues the loads
+                    // that let MMA re-arm this barrier (no-stranding rule).
+                    warp::sync_mask(u32::MAX);
 
                     if is_lane0 {
                         let k_base = (k_idx * 64) as i32;
                         if stage == 0 {
+                            mbarrier_arrive_expect_tx(
+                                &raw const TMA_BAR0,
+                                1,
+                                A_TILE_BYTES + B_TILE_BYTES,
+                            );
                             cp_async_bulk_tensor_2d_g2s(
                                 &raw mut SMEM_A0 as *mut u8,
                                 a_tma,
@@ -2006,12 +2217,12 @@ mod kernels {
                                 n_offset,
                                 &raw mut TMA_BAR0,
                             );
+                        } else {
                             mbarrier_arrive_expect_tx(
-                                &raw const TMA_BAR0,
+                                &raw const TMA_BAR1,
                                 1,
                                 A_TILE_BYTES + B_TILE_BYTES,
                             );
-                        } else {
                             cp_async_bulk_tensor_2d_g2s(
                                 &raw mut SMEM_A1 as *mut u8,
                                 a_tma,
@@ -2025,11 +2236,6 @@ mod kernels {
                                 k_base,
                                 n_offset,
                                 &raw mut TMA_BAR1,
-                            );
-                            mbarrier_arrive_expect_tx(
-                                &raw const TMA_BAR1,
-                                1,
-                                A_TILE_BYTES + B_TILE_BYTES,
                             );
                         }
                     }
@@ -2047,28 +2253,41 @@ mod kernels {
                 loop {
                     let clc_parity = clc_iter & 1;
 
+                    // CLC writes the response through the async proxy. Keep all
+                    // response access in lane 0, then broadcast registers to the
+                    // warp so no lane can observe stale shared memory.
+                    let mut is_canceled = 0u32;
+                    let mut first_stolen = 0u32;
                     if is_lane0 {
+                        fence_proxy_async_shared_cta();
                         mbarrier_arrive_expect_tx(&raw const CLC_BAR, 1, 16);
                         clc_try_cancel(resp_ptr as *mut u8, &raw mut CLC_BAR);
-                    }
 
-                    if is_lane0 {
                         while !mbarrier_try_wait_parity(&raw const CLC_BAR, clc_parity) {}
+
+                        let resp_lo = *resp_ptr;
+                        let resp_hi = *resp_ptr.add(1);
+                        is_canceled = clc_query_is_canceled(resp_lo, resp_hi);
+                        if is_canceled != 0 {
+                            first_stolen = clc_query_get_first_ctaid_x(resp_lo, resp_hi);
+                        }
+                        fence_proxy_async_shared_cta();
                     }
 
-                    let resp_lo = *resp_ptr;
-                    let resp_hi = *resp_ptr.add(1);
-                    let is_canceled = clc_query_is_canceled(resp_lo, resp_hi);
+                    is_canceled = warp::shuffle_sync(u32::MAX, is_canceled, 0);
+                    first_stolen = warp::shuffle_sync(u32::MAX, first_stolen, 0);
 
                     if is_canceled == 0 {
                         if is_lane0 {
+                            while !mbarrier_try_wait_parity(
+                                &raw const TILE_INFO_FREE,
+                                tile_info_free_parity,
+                            ) {}
                             *(&raw mut TILE_INFO as *mut u32).add(2) = 0;
                             mbarrier_arrive(&raw const TILE_READY);
                         }
                         break;
                     }
-
-                    let first_stolen = clc_query_get_first_ctaid_x(resp_lo, resp_hi);
 
                     let mut ci: u32 = 0;
                     while ci < CLUSTER_SIZE {
@@ -2077,6 +2296,11 @@ mod kernels {
                         let tile_n = stolen_ctaid / tiles_m;
 
                         if is_lane0 {
+                            while !mbarrier_try_wait_parity(
+                                &raw const TILE_INFO_FREE,
+                                tile_info_free_parity,
+                            ) {}
+                            tile_info_free_parity ^= 1;
                             *(&raw mut TILE_INFO as *mut u32).add(0) = tile_m;
                             *(&raw mut TILE_INFO as *mut u32).add(1) = tile_n;
                             *(&raw mut TILE_INFO as *mut u32).add(2) = 1;
@@ -2096,10 +2320,19 @@ mod kernels {
                             } else {
                                 while !mbarrier_try_wait_parity(&raw const MMA_BAR1, mma_parity) {}
                             }
+                            // All lanes wait, then sync before lane 0 issues the
+                            // loads that let MMA re-arm this barrier
+                            // (no-stranding rule).
+                            warp::sync_mask(u32::MAX);
 
                             if is_lane0 {
                                 let k_base = (k_idx * 64) as i32;
                                 if stage == 0 {
+                                    mbarrier_arrive_expect_tx(
+                                        &raw const TMA_BAR0,
+                                        1,
+                                        A_TILE_BYTES + B_TILE_BYTES,
+                                    );
                                     cp_async_bulk_tensor_2d_g2s(
                                         &raw mut SMEM_A0 as *mut u8,
                                         a_tma,
@@ -2114,12 +2347,12 @@ mod kernels {
                                         n_off,
                                         &raw mut TMA_BAR0,
                                     );
+                                } else {
                                     mbarrier_arrive_expect_tx(
-                                        &raw const TMA_BAR0,
+                                        &raw const TMA_BAR1,
                                         1,
                                         A_TILE_BYTES + B_TILE_BYTES,
                                     );
-                                } else {
                                     cp_async_bulk_tensor_2d_g2s(
                                         &raw mut SMEM_A1 as *mut u8,
                                         a_tma,
@@ -2133,11 +2366,6 @@ mod kernels {
                                         k_base,
                                         n_off,
                                         &raw mut TMA_BAR1,
-                                    );
-                                    mbarrier_arrive_expect_tx(
-                                        &raw const TMA_BAR1,
-                                        1,
-                                        A_TILE_BYTES + B_TILE_BYTES,
                                     );
                                 }
                             }
@@ -2167,6 +2395,10 @@ mod kernels {
                     tile_parity ^= 1;
 
                     let has_work = *(&raw const TILE_INFO as *const u32).add(2);
+                    warp::sync_mask(u32::MAX);
+                    if is_lane0 {
+                        mbarrier_arrive(&raw const TILE_INFO_FREE);
+                    }
                     if has_work == 0 {
                         break;
                     }
@@ -2174,6 +2406,10 @@ mod kernels {
                     let accum_stage = tile_iter % NUM_ACCUM_STAGES;
                     let tmem_stage_offset = accum_stage * ACCUM_STAGE_COLS;
 
+                    // All lanes may wait here: the next ACCUM_EMPTY phase needs
+                    // an ACCUM_FULL commit from a later tile, which sits behind
+                    // this warp's tile-top sync, so the barrier cannot advance
+                    // past a lane that is still waiting on it.
                     if tile_iter >= NUM_ACCUM_STAGES {
                         let empty_parity = ((tile_iter - NUM_ACCUM_STAGES) / NUM_ACCUM_STAGES) & 1;
                         if accum_stage == 0 {
@@ -2195,17 +2431,24 @@ mod kernels {
                         } else {
                             while !mbarrier_try_wait_parity(&raw const TMA_BAR1, tma_parity) {}
                         }
+                        // All lanes wait, then sync before lane 0 consumes the
+                        // stage. The commit below is what lets the producer
+                        // re-arm this barrier, so ordering it after the sync
+                        // means the barrier can never advance past a lane that
+                        // is still waiting on it -- no lane can strand one
+                        // parity short of a stopped barrier.
+                        warp::sync_mask(u32::MAX);
 
                         if is_lane0 {
                             let smem_a_base = if stage == 0 {
-                                &raw const SMEM_A0 as u64
+                                cvta_generic_to_shared_offset(&raw const SMEM_A0 as *const u8)
                             } else {
-                                &raw const SMEM_A1 as u64
+                                cvta_generic_to_shared_offset(&raw const SMEM_A1 as *const u8)
                             };
                             let smem_b_base = if stage == 0 {
-                                &raw const SMEM_B0 as u64
+                                cvta_generic_to_shared_offset(&raw const SMEM_B0 as *const u8)
                             } else {
-                                &raw const SMEM_B1 as u64
+                                cvta_generic_to_shared_offset(&raw const SMEM_B1 as *const u8)
                             };
 
                             let mut j: u32 = 0;
@@ -2262,6 +2505,7 @@ mod kernels {
             // Epilogue warps (0-3): identical to Phase 4A
             // ════════════════════════════════════════════════════════════════════
             if warp_id < 4 {
+                let is_lane0 = lane_id == 0;
                 let mut epi_tile_iter: u32 = 0;
                 let mut tile_parity: u32 = 0;
 
@@ -2277,12 +2521,15 @@ mod kernels {
                     tile_parity ^= 1;
 
                     let has_work = *(&raw const TILE_INFO as *const u32).add(2);
+                    let tile_m = *(&raw const TILE_INFO as *const u32).add(0);
+                    let tile_n = *(&raw const TILE_INFO as *const u32).add(1);
+                    warp::sync_mask(u32::MAX);
+                    if is_lane0 {
+                        mbarrier_arrive(&raw const TILE_INFO_FREE);
+                    }
                     if has_work == 0 {
                         break;
                     }
-
-                    let tile_m = *(&raw const TILE_INFO as *const u32).add(0);
-                    let tile_n = *(&raw const TILE_INFO as *const u32).add(1);
 
                     let accum_stage = epi_tile_iter % NUM_ACCUM_STAGES;
                     let tmem_stage_offset = accum_stage * ACCUM_STAGE_COLS;
@@ -2319,8 +2566,8 @@ mod kernels {
                             );
                             tcgen05_load_wait();
 
-                            let p0_lo = cvt_f32x2_bf16x2(regs_a[0], regs_a[1]);
-                            let p1_lo = cvt_f32x2_bf16x2(regs_b[0], regs_b[1]);
+                            let p0_lo = cvt_bf16x2_f32(regs_a[0], regs_a[1]);
+                            let p1_lo = cvt_bf16x2_f32(regs_b[0], regs_b[1]);
                             let out_row_lo =
                                 warp_row_base + (tmem_row_block as usize * 16) + row_within_8;
                             let smem_addr_lo = (&raw mut SMEM_OUT as *mut u8).add(
@@ -2330,8 +2577,8 @@ mod kernels {
                             );
                             stmatrix_m8n8_x2(smem_addr_lo, p0_lo, p1_lo);
 
-                            let p0_hi = cvt_f32x2_bf16x2(regs_a[2], regs_a[3]);
-                            let p1_hi = cvt_f32x2_bf16x2(regs_b[2], regs_b[3]);
+                            let p0_hi = cvt_bf16x2_f32(regs_a[2], regs_a[3]);
+                            let p1_hi = cvt_bf16x2_f32(regs_b[2], regs_b[3]);
                             let out_row_hi =
                                 warp_row_base + (tmem_row_block as usize * 16) + 8 + row_within_8;
                             let smem_addr_hi = (&raw mut SMEM_OUT as *mut u8).add(
@@ -2376,6 +2623,7 @@ mod kernels {
 
             // ── Cleanup ──
             thread::sync_threads();
+            cluster::cluster_sync();
             if warp_id == 0 {
                 tcgen05_dealloc(tmem_addr, 512);
             }
@@ -2389,6 +2637,7 @@ mod kernels {
                 mbarrier_inval(&raw mut ACCUM_EMPTY0);
                 mbarrier_inval(&raw mut ACCUM_EMPTY1);
                 mbarrier_inval(&raw mut TILE_READY);
+                mbarrier_inval(&raw mut TILE_INFO_FREE);
                 mbarrier_inval(&raw mut CLC_BAR);
             }
         }
@@ -2397,29 +2646,22 @@ mod kernels {
     /// Phase 4C: CLC + TMA multicast for B tiles.
     ///
     /// ```text
-    ///   Cluster of 4 CTAs sharing an SM:
+    ///   Cluster of 4 CTAs co-scheduled across SMs:
     ///
-    ///   CTA 0 (rank 0)              CTA 1 (rank 1)         CTA 2, CTA 3 (similar)
-    ///   ┌──────────────────┐        ┌──────────────────┐
-    ///   │ Warp 4 (TMA):    │        │ Warp 4 (TMA):    │
-    ///   │                  │        │                  │
-    ///   │ Each K-iter:     │        │ Each K-iter:     │
-    ///   │  arrive MCAST_BAR│        │  arrive MCAST_BAR│─ ─▶ rank 0's MCAST_BAR
-    ///   │  wait MCAST_BAR  │◄─ ─ ─ ─│                  │    (cluster-wide arrive
-    ///   │  (all 4 arrived) │        │                  │     via mbarrier_arrive_cluster)
-    ///   │                  │        │                  │
-    ///   │  arm TMA_BAR with│        │  arm TMA_BAR with│
-    ///   │  arrive_expect_tx│        │  arrive_expect_tx│   ← CRITICAL: must arm
-    ///   │                  │        │                  │     BEFORE multicast lands
-    ///   │  TMA A → own SMEM│        │  TMA A → own SMEM│
-    ///   │  TMA B multicast │════════│══▶ B lands in    │
-    ///   │  to ALL CTAs     │════════│══▶ all 4 SMEM    │
-    ///   │                  │        │  + deposits TX   │
-    ///   │                  │        │  on all TMA_BARs │
-    ///   └──────────────────┘        └──────────────────┘
+    ///   Every CTA (warp 4)                    CTA 0 / rank 0
+    ///   ┌──────────────────────────┐          ┌──────────────────────────┐
+    ///   │ wait MMA_BAR            │          │                          │
+    ///   │ arm local TMA_BAR       │          │                          │
+    ///   │ TMA A → own SMEM        │          │                          │
+    ///   │ arrive rank-0 MCAST_BAR ├─────────▶│ cluster-acquire wait     │
+    ///   │                          │          │ for all four CTAs        │
+    ///   │                          │          │ TMA B multicast ────────┼──▶ all CTA SMEM
+    ///   └──────────────────────────┘          └──────────────────────────┘
     ///
     ///   CLC work-stealing (clc_try_cancel_multicast):
-    ///     Rank 0 steals a cluster → response multicast to all CTAs
+    ///     Every CTA arms its local CLC_BAR and arrives at CLC_READY
+    ///     Rank 0 waits for all CTAs, then multicasts one cancellation response
+    ///     Lane 0 in each CTA decodes and warp-broadcasts the result
     ///     Each CTA derives: my_tile = first_stolen + my_rank
     /// ```
     ///
@@ -2431,10 +2673,9 @@ mod kernels {
     /// must signal they've consumed the previous B data from that stage. Each non-rank-0
     /// CTA arrives at rank 0's MCAST_BAR via `mbarrier_arrive_cluster`.
     ///
-    /// Critical ordering: `arrive_expect_tx` BEFORE TMA loads. With multicast, rank 0's
-    /// TMA deposits bytes into all CTAs simultaneously. If a slower CTA hasn't armed its
-    /// barrier yet, the bytes land on an un-armed barrier — the TX count was never set,
-    /// so the barrier either completes prematurely or never completes.
+    /// Critical ordering: each CTA arms its local `TMA_BAR` before issuing its A load
+    /// and before advertising readiness through `MCAST_BAR`. Rank 0 uses a cluster-acquire
+    /// wait before issuing B multicast, so remote B bytes cannot reach an unarmed barrier.
     ///
     /// Grid launch: grid_dim = (total_tiles, 1, 1), cluster_dim = (4, 1, 1)
     #[kernel]
@@ -2472,10 +2713,14 @@ mod kernels {
             static mut ACCUM_EMPTY1: Barrier = Barrier::UNINIT;
 
             static mut TILE_READY: Barrier = Barrier::UNINIT;
+            // The producer must not overwrite TILE_INFO until every reader warp
+            // has copied the current tile coordinates/has_work flag.
+            static mut TILE_INFO_FREE: Barrier = Barrier::UNINIT;
 
             // CLC: 16-byte response buffer + mbarrier
             static mut CLC_RESPONSE: SharedArray<u64, 2, 16> = SharedArray::UNINIT;
             static mut CLC_BAR: Barrier = Barrier::UNINIT;
+            static mut CLC_READY: Barrier = Barrier::UNINIT;
 
             // TMA multicast: cluster-wide consumer barriers.
             // Rank 0's TMA warp waits on these before multicasting B to ensure
@@ -2512,10 +2757,15 @@ mod kernels {
                 mbarrier_init(&raw mut ACCUM_EMPTY0, 128);
                 mbarrier_init(&raw mut ACCUM_EMPTY1, 128);
                 mbarrier_init(&raw mut TILE_READY, 1);
+                // One synchronized leader per reader warp acknowledges that all
+                // lanes have copied the mailbox before the producer reuses it.
+                mbarrier_init(&raw mut TILE_INFO_FREE, 5);
                 mbarrier_init(&raw mut CLC_BAR, 1);
+                mbarrier_init(&raw mut CLC_READY, CLUSTER_SIZE);
                 // MCAST_BARs: all 4 cluster CTAs must arrive before rank 0 can reuse B buffer
                 mbarrier_init(&raw mut MCAST_BAR0, CLUSTER_SIZE);
                 mbarrier_init(&raw mut MCAST_BAR1, CLUSTER_SIZE);
+                fence_mbarrier_init_release_cluster();
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
@@ -2524,8 +2774,18 @@ mod kernels {
 
             // map_shared_rank translates a local SMEM pointer to the address in rank 0's
             // shared memory, for use with mbarrier_arrive_cluster (cross-CTA barrier arrive).
-            let rank0_mcast_bar0_addr = cluster::map_shared_rank(&raw const MCAST_BAR0, 0) as u64;
-            let rank0_mcast_bar1_addr = cluster::map_shared_rank(&raw const MCAST_BAR1, 0) as u64;
+            let rank0_mcast_bar0_addr = cvta_generic_to_shared_offset(cluster::map_shared_rank(
+                &raw const MCAST_BAR0,
+                0,
+            ) as *const u8);
+            let rank0_mcast_bar1_addr = cvta_generic_to_shared_offset(cluster::map_shared_rank(
+                &raw const MCAST_BAR1,
+                0,
+            ) as *const u8);
+            let rank0_clc_ready_addr = cvta_generic_to_shared_offset(cluster::map_shared_rank(
+                &raw const CLC_READY,
+                0,
+            ) as *const u8);
 
             // Pre-arrive MMA_BARs so TMA can proceed on the first K-iteration
             if tid == 0 {
@@ -2552,9 +2812,9 @@ mod kernels {
 
             cluster::cluster_sync();
 
-            // NOTE: No pre-arrive for MCAST_BARs. The first use of each stage
-            // (global_k=0 for stage 0, global_k=1 for stage 1) skips the wait
-            // because the buffers are empty — nothing to protect from overwrite.
+            // No synthetic pre-arrive is needed for MCAST_BARs. On the first use
+            // of each stage, every CTA arms its local TMA_BAR, arrives at rank 0's
+            // MCAST_BAR, and rank 0 performs the normal cluster-acquire wait.
 
             // ════════════════════════════════════════════════════════════════════
             // TMA Producer (warp 4): CLC tile scheduling + TMA multicast
@@ -2564,6 +2824,7 @@ mod kernels {
                 let is_rank0 = my_rank == 0;
                 let mut global_k: u32 = 0;
                 let mut clc_iter: u32 = 0;
+                let mut tile_info_free_parity: u32 = 0;
 
                 // ── First tile: use our own blockIdx (hardware-assigned) ──
                 let first_ctaid = thread::blockIdx_x();
@@ -2590,29 +2851,14 @@ mod kernels {
                     } else {
                         while !mbarrier_try_wait_parity(&raw const MMA_BAR1, mma_parity) {}
                     }
+                    // All lanes wait, then sync before lane 0 issues the loads
+                    // that let MMA re-arm this barrier (no-stranding rule).
+                    warp::sync_mask(u32::MAX);
 
-                    // Signal rank 0's MCAST_BAR: this CTA has consumed B from this stage.
+                    // Arm the local completion barrier and issue the per-CTA A
+                    // copy before advertising that this CTA is ready for B multicast.
+                    let k_base = (k_idx * 64) as i32;
                     if is_lane0 {
-                        fence_proxy_async_shared_cta();
-                        if stage == 0 {
-                            mbarrier_arrive_cluster(rank0_mcast_bar0_addr);
-                        } else {
-                            mbarrier_arrive_cluster(rank0_mcast_bar1_addr);
-                        }
-                    }
-
-                    // Rank 0: wait for ALL cluster CTAs to signal consumption via MCAST_BAR.
-                    let mcast_parity = (global_k >> 1) & 1;
-                    if is_rank0 {
-                        if stage == 0 {
-                            while !mbarrier_try_wait_parity(&raw const MCAST_BAR0, mcast_parity) {}
-                        } else {
-                            while !mbarrier_try_wait_parity(&raw const MCAST_BAR1, mcast_parity) {}
-                        }
-                    }
-
-                    if is_lane0 {
-                        let k_base = (k_idx * 64) as i32;
                         if stage == 0 {
                             mbarrier_arrive_expect_tx(
                                 &raw const TMA_BAR0,
@@ -2626,19 +2872,9 @@ mod kernels {
                                 m_offset,
                                 &raw mut TMA_BAR0,
                             );
-                            if is_rank0 {
-                                cp_async_bulk_tensor_2d_g2s_multicast(
-                                    &raw mut SMEM_B0 as *mut u8,
-                                    b_tma,
-                                    k_base,
-                                    n_offset,
-                                    &raw mut TMA_BAR0,
-                                    CTA_MASK_ALL,
-                                );
-                            }
+                            fence_proxy_async_shared_cta();
+                            mbarrier_arrive_cluster(rank0_mcast_bar0_addr);
                         } else {
-                            // Arm expected bytes before issuing copies so remote multicast
-                            // bytes cannot land on an un-armed barrier in slower CTAs.
                             mbarrier_arrive_expect_tx(
                                 &raw const TMA_BAR1,
                                 1,
@@ -2651,16 +2887,46 @@ mod kernels {
                                 m_offset,
                                 &raw mut TMA_BAR1,
                             );
-                            if is_rank0 {
-                                cp_async_bulk_tensor_2d_g2s_multicast(
-                                    &raw mut SMEM_B1 as *mut u8,
-                                    b_tma,
-                                    k_base,
-                                    n_offset,
-                                    &raw mut TMA_BAR1,
-                                    CTA_MASK_ALL,
-                                );
-                            }
+                            fence_proxy_async_shared_cta();
+                            mbarrier_arrive_cluster(rank0_mcast_bar1_addr);
+                        }
+                    }
+
+                    // Remote arrivals require a cluster-acquire wait at rank 0.
+                    let mcast_parity = (global_k >> 1) & 1;
+                    if is_rank0 {
+                        if stage == 0 {
+                            while !mbarrier_try_wait_parity_cluster(
+                                &raw const MCAST_BAR0,
+                                mcast_parity,
+                            ) {}
+                        } else {
+                            while !mbarrier_try_wait_parity_cluster(
+                                &raw const MCAST_BAR1,
+                                mcast_parity,
+                            ) {}
+                        }
+                    }
+
+                    if is_rank0 && is_lane0 {
+                        if stage == 0 {
+                            cp_async_bulk_tensor_2d_g2s_multicast(
+                                &raw mut SMEM_B0 as *mut u8,
+                                b_tma,
+                                k_base,
+                                n_offset,
+                                &raw mut TMA_BAR0,
+                                CTA_MASK_ALL,
+                            );
+                        } else {
+                            cp_async_bulk_tensor_2d_g2s_multicast(
+                                &raw mut SMEM_B1 as *mut u8,
+                                b_tma,
+                                k_base,
+                                n_offset,
+                                &raw mut TMA_BAR1,
+                                CTA_MASK_ALL,
+                            );
                         }
                     }
 
@@ -2677,33 +2943,61 @@ mod kernels {
                     loop {
                         let clc_parity = clc_iter & 1;
 
+                        // Arm every CTA-local completion barrier before rank 0 can
+                        // multicast the next response. CLC_READY also proves that
+                        // every CTA is still alive and has released its prior read.
+                        let mut is_canceled = 0u32;
+                        let mut first_stolen = 0u32;
                         if is_lane0 {
-                            mbarrier_arrive_expect_tx(&raw const CLC_BAR, 1, 16);
+                            mbarrier_arrive_expect_tx_cluster(&raw const CLC_BAR, 1, 16);
+                            mbarrier_arrive_cluster(rank0_clc_ready_addr);
+
                             if is_rank0 {
+                                while !mbarrier_try_wait_parity_cluster(
+                                    &raw const CLC_READY,
+                                    clc_parity,
+                                ) {}
+                                fence_proxy_async_generic_acquire_shared_cluster_cluster();
                                 clc_try_cancel_multicast(resp_ptr as *mut u8, &raw mut CLC_BAR);
                             }
+
+                            while !mbarrier_try_wait_parity_cluster(&raw const CLC_BAR, clc_parity)
+                            {
+                            }
+
+                            let resp_lo = *resp_ptr;
+                            let resp_hi = *resp_ptr.add(1);
+                            is_canceled = clc_query_is_canceled(resp_lo, resp_hi);
+                            if is_canceled != 0 {
+                                first_stolen = clc_query_get_first_ctaid_x(resp_lo, resp_hi);
+                            }
+                            fence_proxy_async_generic_release_shared_cta_cluster();
                         }
 
-                        while !mbarrier_try_wait_parity(&raw const CLC_BAR, clc_parity) {}
-
-                        let resp_lo = *resp_ptr;
-                        let resp_hi = *resp_ptr.add(1);
-                        let is_canceled = clc_query_is_canceled(resp_lo, resp_hi);
+                        is_canceled = warp::shuffle_sync(u32::MAX, is_canceled, 0);
+                        first_stolen = warp::shuffle_sync(u32::MAX, first_stolen, 0);
 
                         if is_canceled == 0 {
                             if is_lane0 {
+                                while !mbarrier_try_wait_parity(
+                                    &raw const TILE_INFO_FREE,
+                                    tile_info_free_parity,
+                                ) {}
                                 *(&raw mut TILE_INFO as *mut u32).add(2) = 0;
                                 mbarrier_arrive(&raw const TILE_READY);
                             }
                             break;
                         }
-
-                        let first_stolen = clc_query_get_first_ctaid_x(resp_lo, resp_hi);
                         let my_ctaid = first_stolen + my_rank;
                         let tile_m = my_ctaid % tiles_m;
                         let tile_n = my_ctaid / tiles_m;
 
                         if is_lane0 {
+                            while !mbarrier_try_wait_parity(
+                                &raw const TILE_INFO_FREE,
+                                tile_info_free_parity,
+                            ) {}
+                            tile_info_free_parity ^= 1;
                             *(&raw mut TILE_INFO as *mut u32).add(0) = tile_m;
                             *(&raw mut TILE_INFO as *mut u32).add(1) = tile_n;
                             *(&raw mut TILE_INFO as *mut u32).add(2) = 1;
@@ -2724,35 +3018,15 @@ mod kernels {
                             } else {
                                 while !mbarrier_try_wait_parity(&raw const MMA_BAR1, mma_parity) {}
                             }
+                            // All lanes wait, then sync before lane 0 issues the
+                            // loads that let MMA re-arm this barrier
+                            // (no-stranding rule).
+                            warp::sync_mask(u32::MAX);
 
-                            // Signal rank 0's MCAST_BAR: this CTA consumed B from this stage.
+                            // Arm the local barrier and start A before advertising
+                            // readiness for the cluster-wide B multicast.
+                            let k_base = (k_idx * 64) as i32;
                             if is_lane0 {
-                                fence_proxy_async_shared_cta();
-                                if stage == 0 {
-                                    mbarrier_arrive_cluster(rank0_mcast_bar0_addr);
-                                } else {
-                                    mbarrier_arrive_cluster(rank0_mcast_bar1_addr);
-                                }
-                            }
-
-                            // Rank 0: wait for ALL cluster CTAs before multicasting B.
-                            let mcast_parity = (global_k >> 1) & 1;
-                            if is_rank0 {
-                                if stage == 0 {
-                                    while !mbarrier_try_wait_parity(
-                                        &raw const MCAST_BAR0,
-                                        mcast_parity,
-                                    ) {}
-                                } else {
-                                    while !mbarrier_try_wait_parity(
-                                        &raw const MCAST_BAR1,
-                                        mcast_parity,
-                                    ) {}
-                                }
-                            }
-
-                            if is_lane0 {
-                                let k_base = (k_idx * 64) as i32;
                                 if stage == 0 {
                                     mbarrier_arrive_expect_tx(
                                         &raw const TMA_BAR0,
@@ -2766,19 +3040,9 @@ mod kernels {
                                         m_off,
                                         &raw mut TMA_BAR0,
                                     );
-                                    if is_rank0 {
-                                        cp_async_bulk_tensor_2d_g2s_multicast(
-                                            &raw mut SMEM_B0 as *mut u8,
-                                            b_tma,
-                                            k_base,
-                                            n_off,
-                                            &raw mut TMA_BAR0,
-                                            CTA_MASK_ALL,
-                                        );
-                                    }
+                                    fence_proxy_async_shared_cta();
+                                    mbarrier_arrive_cluster(rank0_mcast_bar0_addr);
                                 } else {
-                                    // Same ordering as the first tile: arm barrier before any
-                                    // local or remote TMA bytes can arrive on this stage.
                                     mbarrier_arrive_expect_tx(
                                         &raw const TMA_BAR1,
                                         1,
@@ -2791,16 +3055,45 @@ mod kernels {
                                         m_off,
                                         &raw mut TMA_BAR1,
                                     );
-                                    if is_rank0 {
-                                        cp_async_bulk_tensor_2d_g2s_multicast(
-                                            &raw mut SMEM_B1 as *mut u8,
-                                            b_tma,
-                                            k_base,
-                                            n_off,
-                                            &raw mut TMA_BAR1,
-                                            CTA_MASK_ALL,
-                                        );
-                                    }
+                                    fence_proxy_async_shared_cta();
+                                    mbarrier_arrive_cluster(rank0_mcast_bar1_addr);
+                                }
+                            }
+
+                            let mcast_parity = (global_k >> 1) & 1;
+                            if is_rank0 {
+                                if stage == 0 {
+                                    while !mbarrier_try_wait_parity_cluster(
+                                        &raw const MCAST_BAR0,
+                                        mcast_parity,
+                                    ) {}
+                                } else {
+                                    while !mbarrier_try_wait_parity_cluster(
+                                        &raw const MCAST_BAR1,
+                                        mcast_parity,
+                                    ) {}
+                                }
+                            }
+
+                            if is_rank0 && is_lane0 {
+                                if stage == 0 {
+                                    cp_async_bulk_tensor_2d_g2s_multicast(
+                                        &raw mut SMEM_B0 as *mut u8,
+                                        b_tma,
+                                        k_base,
+                                        n_off,
+                                        &raw mut TMA_BAR0,
+                                        CTA_MASK_ALL,
+                                    );
+                                } else {
+                                    cp_async_bulk_tensor_2d_g2s_multicast(
+                                        &raw mut SMEM_B1 as *mut u8,
+                                        b_tma,
+                                        k_base,
+                                        n_off,
+                                        &raw mut TMA_BAR1,
+                                        CTA_MASK_ALL,
+                                    );
                                 }
                             }
 
@@ -2827,6 +3120,10 @@ mod kernels {
                     tile_parity ^= 1;
 
                     let has_work = *(&raw const TILE_INFO as *const u32).add(2);
+                    warp::sync_mask(u32::MAX);
+                    if is_lane0 {
+                        mbarrier_arrive(&raw const TILE_INFO_FREE);
+                    }
                     if has_work == 0 {
                         break;
                     }
@@ -2834,6 +3131,10 @@ mod kernels {
                     let accum_stage = tile_iter % NUM_ACCUM_STAGES;
                     let tmem_stage_offset = accum_stage * ACCUM_STAGE_COLS;
 
+                    // All lanes may wait here: the next ACCUM_EMPTY phase needs
+                    // an ACCUM_FULL commit from a later tile, which sits behind
+                    // this warp's tile-top sync, so the barrier cannot advance
+                    // past a lane that is still waiting on it.
                     if tile_iter >= NUM_ACCUM_STAGES {
                         let empty_parity = ((tile_iter - NUM_ACCUM_STAGES) / NUM_ACCUM_STAGES) & 1;
                         if accum_stage == 0 {
@@ -2855,17 +3156,24 @@ mod kernels {
                         } else {
                             while !mbarrier_try_wait_parity(&raw const TMA_BAR1, tma_parity) {}
                         }
+                        // All lanes wait, then sync before lane 0 consumes the
+                        // stage. The commit below is what lets the producer
+                        // re-arm this barrier, so ordering it after the sync
+                        // means the barrier can never advance past a lane that
+                        // is still waiting on it -- no lane can strand one
+                        // parity short of a stopped barrier.
+                        warp::sync_mask(u32::MAX);
 
                         if is_lane0 {
                             let smem_a_base = if stage == 0 {
-                                &raw const SMEM_A0 as u64
+                                cvta_generic_to_shared_offset(&raw const SMEM_A0 as *const u8)
                             } else {
-                                &raw const SMEM_A1 as u64
+                                cvta_generic_to_shared_offset(&raw const SMEM_A1 as *const u8)
                             };
                             let smem_b_base = if stage == 0 {
-                                &raw const SMEM_B0 as u64
+                                cvta_generic_to_shared_offset(&raw const SMEM_B0 as *const u8)
                             } else {
-                                &raw const SMEM_B1 as u64
+                                cvta_generic_to_shared_offset(&raw const SMEM_B1 as *const u8)
                             };
 
                             let mut j: u32 = 0;
@@ -2922,6 +3230,7 @@ mod kernels {
             // Epilogue warps (0-3): identical to Phase 4A
             // ════════════════════════════════════════════════════════════════════
             if warp_id < 4 {
+                let is_lane0 = lane_id == 0;
                 let mut epi_tile_iter: u32 = 0;
                 let mut tile_parity: u32 = 0;
 
@@ -2937,12 +3246,15 @@ mod kernels {
                     tile_parity ^= 1;
 
                     let has_work = *(&raw const TILE_INFO as *const u32).add(2);
+                    let tile_m = *(&raw const TILE_INFO as *const u32).add(0);
+                    let tile_n = *(&raw const TILE_INFO as *const u32).add(1);
+                    warp::sync_mask(u32::MAX);
+                    if is_lane0 {
+                        mbarrier_arrive(&raw const TILE_INFO_FREE);
+                    }
                     if has_work == 0 {
                         break;
                     }
-
-                    let tile_m = *(&raw const TILE_INFO as *const u32).add(0);
-                    let tile_n = *(&raw const TILE_INFO as *const u32).add(1);
 
                     let accum_stage = epi_tile_iter % NUM_ACCUM_STAGES;
                     let tmem_stage_offset = accum_stage * ACCUM_STAGE_COLS;
@@ -2979,8 +3291,8 @@ mod kernels {
                             );
                             tcgen05_load_wait();
 
-                            let p0_lo = cvt_f32x2_bf16x2(regs_a[0], regs_a[1]);
-                            let p1_lo = cvt_f32x2_bf16x2(regs_b[0], regs_b[1]);
+                            let p0_lo = cvt_bf16x2_f32(regs_a[0], regs_a[1]);
+                            let p1_lo = cvt_bf16x2_f32(regs_b[0], regs_b[1]);
                             let out_row_lo =
                                 warp_row_base + (tmem_row_block as usize * 16) + row_within_8;
                             let smem_addr_lo = (&raw mut SMEM_OUT as *mut u8).add(
@@ -2990,8 +3302,8 @@ mod kernels {
                             );
                             stmatrix_m8n8_x2(smem_addr_lo, p0_lo, p1_lo);
 
-                            let p0_hi = cvt_f32x2_bf16x2(regs_a[2], regs_a[3]);
-                            let p1_hi = cvt_f32x2_bf16x2(regs_b[2], regs_b[3]);
+                            let p0_hi = cvt_bf16x2_f32(regs_a[2], regs_a[3]);
+                            let p1_hi = cvt_bf16x2_f32(regs_b[2], regs_b[3]);
                             let out_row_hi =
                                 warp_row_base + (tmem_row_block as usize * 16) + 8 + row_within_8;
                             let smem_addr_hi = (&raw mut SMEM_OUT as *mut u8).add(
@@ -3036,6 +3348,7 @@ mod kernels {
 
             // ── Cleanup ──
             thread::sync_threads();
+            cluster::cluster_sync();
             if warp_id == 0 {
                 tcgen05_dealloc(tmem_addr, 512);
             }
@@ -3049,7 +3362,9 @@ mod kernels {
                 mbarrier_inval(&raw mut ACCUM_EMPTY0);
                 mbarrier_inval(&raw mut ACCUM_EMPTY1);
                 mbarrier_inval(&raw mut TILE_READY);
+                mbarrier_inval(&raw mut TILE_INFO_FREE);
                 mbarrier_inval(&raw mut CLC_BAR);
+                mbarrier_inval(&raw mut CLC_READY);
                 mbarrier_inval(&raw mut MCAST_BAR0);
                 mbarrier_inval(&raw mut MCAST_BAR1);
             }
@@ -3079,9 +3394,17 @@ mod kernels {
     ///   MMA barriers still use normal multicast (tcgen05_commit_multicast_cg2 with
     ///   CTA_MASK_PAIR=0b11), so both CTAs receive MMA completion signals.
     ///
-    /// CLC work-stealing: rank 0 issues clc_try_cancel_multicast; both CTAs receive the
-    /// response via CLC_BAR. Tile indices are derived by dividing the CLC first_ctaid_x
-    /// by the cluster size (2), NOT using raw CTA IDs.
+    /// CLC work-stealing: both CTAs arm their local CLC_BAR and arrive at the leader's
+    /// CLC_READY; rank 0 waits for the pair, then issues clc_try_cancel_multicast so both
+    /// CTAs receive the response via CLC_BAR. Lane 0 in each CTA decodes the response and
+    /// warp-broadcasts the result. Tile indices are derived by dividing the CLC
+    /// first_ctaid_x by the cluster size (2), NOT using raw CTA IDs.
+    ///
+    /// # Shape contract
+    ///
+    /// `k` must be a multiple of 256. With a K tile size of 64, this makes `k_iters`
+    /// a multiple of four, so every output tile starts on pipeline stage 0. The MMA
+    /// consumer relies on that reset to keep its unrolled stage selection constant.
     #[kernel]
     #[cluster_launch(2, 1, 1)]
     pub unsafe fn gemm_sol_clc_multicast_4_stage_pipeline(
@@ -3121,9 +3444,29 @@ mod kernels {
             static mut ACCUM_EMPTY0: Barrier = Barrier::UNINIT;
             static mut ACCUM_EMPTY1: Barrier = Barrier::UNINIT;
             static mut TILE_READY: Barrier = Barrier::UNINIT;
+            // The producer must not overwrite TILE_INFO until every reader warp
+            // has copied the current tile coordinates/has_work flag.
+            //
+            // CTA-LOCALITY INVARIANT: TILE_INFO / TILE_READY / TILE_INFO_FREE
+            // are accessed only by warps of the owning CTA -- never via
+            // cluster::map_shared_rank/mapa and never by the TMA/async proxy.
+            // Both CTAs of the pair compute tile metadata independently from
+            // the multicast CLC response, each into its own mailbox, so the
+            // CTA-scope mbarrier_arrive/mbarrier_try_wait_parity handshake is
+            // sufficient. The init count of 5 is the CTA-local reader set:
+            // epilogue warps 0-3 plus the MMA warp's tile-top ack, none gated
+            // by elect_one_cta (gating the MMA ack would leave the follower
+            // CTA one arrival short and deadlock its producer). If any access
+            // ever becomes cross-CTA (e.g. a leader-only publish shared via
+            // map_shared_rank, or TILE_INFO delivered by multicast), the acks
+            // must become mbarrier_arrive_cluster, the producer wait
+            // mbarrier_try_wait_parity_cluster, and
+            // fence_mbarrier_init_release_cluster must follow mbarrier_init.
+            static mut TILE_INFO_FREE: Barrier = Barrier::UNINIT;
 
             static mut CLC_RESPONSE: SharedArray<u64, 2, 16> = SharedArray::UNINIT;
             static mut CLC_BAR: Barrier = Barrier::UNINIT;
+            static mut CLC_READY: Barrier = Barrier::UNINIT;
 
             const A_TILE_BYTES: u32 = 128 * 64 * 2;
             const B_TILE_BYTES: u32 = 64 * 64 * 2; // 64 B rows per CTA (split by rank)
@@ -3135,11 +3478,16 @@ mod kernels {
             const MMA_WARP: u32 = 5;
             const NUM_ACCUM_STAGES: u32 = 2;
             const ACCUM_STAGE_COLS: u32 = 128;
+            const CLUSTER_SIZE: u32 = 2;
             const CTA_MASK_PAIR: u16 = 0b11;
             // Clears bit 24 (CTA rank within pair) + alignment bits 2:0 of a shared
             // memory barrier address, redirecting TMA completions to the leader CTA's
             // barrier.
             const PEER_BIT_MASK: u32 = 0xFEFFFFF8;
+            // L2 cache-blocking: visit tiles in vertical N-bands SWIZZLE_G wide so
+            // tiles done near-in-time share A-rows + a small set of B-cols in L2.
+            // This is the dominant data-movement lever at large sizes (~+88% @16384).
+            const SWIZZLE_G: u32 = 8;
 
             let n = n as u32;
             let k = k as u32;
@@ -3164,7 +3512,15 @@ mod kernels {
                 mbarrier_init(&raw mut ACCUM_EMPTY0, 256);
                 mbarrier_init(&raw mut ACCUM_EMPTY1, 256);
                 mbarrier_init(&raw mut TILE_READY, 1);
+                // One synchronized leader per reader warp acknowledges that all
+                // lanes have copied the mailbox before the producer reuses it.
+                mbarrier_init(&raw mut TILE_INFO_FREE, 5);
                 mbarrier_init(&raw mut CLC_BAR, 1);
+                mbarrier_init(&raw mut CLC_READY, CLUSTER_SIZE);
+                // The follower's lane 0 arrives at the leader's CLC_READY via a
+                // map_shared_rank address, so remote arrivals must be able to
+                // observe the initialized barrier state.
+                fence_mbarrier_init_release_cluster();
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
@@ -3199,6 +3555,7 @@ mod kernels {
                 let is_lane0 = lane_id == 0;
                 let mut tile_seq: u32 = 0;
                 let mut clc_iter: u32 = 0;
+                let mut tile_info_free_parity: u32 = 0;
 
                 // BUG FIX: CLC assigns consecutive blockIdx values to CTAs in a cluster.
                 // For a cluster of size 2: CTA pair (0,1) has blockIdx (0,1), pair (2,3) has
@@ -3207,8 +3564,37 @@ mod kernels {
                 // correct (each CTA computed its own rank's 128 rows at the wrong tile).
                 let cluster_base_id = thread::blockIdx_x() - my_rank;
                 let tile_idx = cluster_base_id / 2;
-                let first_tile_m = tile_idx % tiles_m;
-                let first_tile_n = tile_idx / tiles_m;
+                // L2 CACHE-BLOCKING SWIZZLE (CUTLASS-style tile ordering).
+                //
+                // Change the order in which output tiles are assigned to clusters. Split
+                // the N direction into bands of at most SWIZZLE_G columns, visit every M
+                // row in one band, and then move to the next band.
+                //
+                // For SWIZZLE_G = 3, the first band is visited in this order:
+                //
+                //   tile_idx:  0      1      2      3      4      5
+                //   C tile:   (0,0)  (0,1)  (0,2)  (1,0)  (1,1)  (1,2)  ...
+                //
+                // Within each M row, these tiles reuse the same A tile while reading
+                // neighboring B tiles. The same small set of B tiles is then revisited for
+                // the next M row, so the data is more likely to still be in the L2 cache.
+                //
+                // This changes only the visit order. The mapping from tile_idx to
+                // (tile_m, tile_n) is one-to-one, and TILE_INFO tells the epilogue where to
+                // write C. Every output tile is still computed exactly once with the same
+                // result.
+                let tiles_n = _tiles_n;
+                let group_tiles = SWIZZLE_G * tiles_m;
+                let group = tile_idx / group_tiles;
+                let in_group = tile_idx % group_tiles;
+                let n_start = group * SWIZZLE_G;
+                let band_w = if SWIZZLE_G < tiles_n - n_start {
+                    SWIZZLE_G
+                } else {
+                    tiles_n - n_start
+                };
+                let first_tile_m = in_group / band_w;
+                let first_tile_n = n_start + in_group % band_w;
 
                 if is_lane0 {
                     *(&raw mut TILE_INFO as *mut u32).add(0) = first_tile_m;
@@ -3267,6 +3653,9 @@ mod kernels {
                     // This is an MMA barrier wait (not TMA) — safe for both CTAs because
                     // tcgen05_commit_multicast_cg2 multicasts to both CTAs' MMA barriers.
                     while !mbarrier_try_wait_parity(mma_bar_const, mma_parity) {}
+                    // All lanes wait, then sync before lane 0 issues the loads
+                    // that let MMA re-arm this barrier (no-stranding rule).
+                    warp::sync_mask(u32::MAX);
 
                     // BARRIER ALIASING PROTOCOL (cta_group::2):
                     // PEER_BIT_MASK clears bit 24 of the barrier address, redirecting both
@@ -3306,24 +3695,59 @@ mod kernels {
                 }
                 tile_seq += 1;
 
+                // map_shared_rank translates a local SMEM pointer to the address in
+                // the leader's shared memory, for use with mbarrier_arrive_cluster
+                // (cross-CTA barrier arrive).
+                let leader_clc_ready_addr = cvta_generic_to_shared_offset(
+                    cluster::map_shared_rank(&raw const CLC_READY, 0) as *const u8,
+                );
+
                 let resp_ptr = &raw mut CLC_RESPONSE as *mut u64;
                 loop {
                     let clc_parity = clc_iter & 1;
 
+                    // Arm every CTA-local completion barrier before the leader can
+                    // multicast the next response. CLC_READY also proves that both
+                    // CTAs are still alive and have released their prior read.
+                    //
+                    // CLC writes the response through the async proxy. Keep all
+                    // response access in lane 0, then broadcast registers to the
+                    // warp so no lane can observe stale shared memory.
+                    let mut is_canceled = 0u32;
+                    let mut first_stolen = 0u32;
                     if is_lane0 {
-                        mbarrier_arrive_expect_tx(&raw const CLC_BAR, 1, 16);
+                        mbarrier_arrive_expect_tx_cluster(&raw const CLC_BAR, 1, 16);
+                        mbarrier_arrive_cluster(leader_clc_ready_addr);
+
                         if elect_one_cta {
+                            while !mbarrier_try_wait_parity_cluster(
+                                &raw const CLC_READY,
+                                clc_parity,
+                            ) {}
+                            fence_proxy_async_generic_acquire_shared_cluster_cluster();
                             clc_try_cancel_multicast(resp_ptr as *mut u8, &raw mut CLC_BAR);
                         }
-                    }
-                    while !mbarrier_try_wait_parity(&raw const CLC_BAR, clc_parity) {}
 
-                    let resp_lo = *resp_ptr;
-                    let resp_hi = *resp_ptr.add(1);
-                    let is_canceled = clc_query_is_canceled(resp_lo, resp_hi);
+                        while !mbarrier_try_wait_parity_cluster(&raw const CLC_BAR, clc_parity) {}
+
+                        let resp_lo = *resp_ptr;
+                        let resp_hi = *resp_ptr.add(1);
+                        is_canceled = clc_query_is_canceled(resp_lo, resp_hi);
+                        if is_canceled != 0 {
+                            first_stolen = clc_query_get_first_ctaid_x(resp_lo, resp_hi);
+                        }
+                        fence_proxy_async_generic_release_shared_cta_cluster();
+                    }
+
+                    is_canceled = warp::shuffle_sync(u32::MAX, is_canceled, 0);
+                    first_stolen = warp::shuffle_sync(u32::MAX, first_stolen, 0);
 
                     if is_canceled == 0 {
                         if is_lane0 {
+                            while !mbarrier_try_wait_parity(
+                                &raw const TILE_INFO_FREE,
+                                tile_info_free_parity,
+                            ) {}
                             *(&raw mut TILE_INFO as *mut u32).add(2) = 0;
                             mbarrier_arrive(&raw const TILE_READY);
                         }
@@ -3333,12 +3757,27 @@ mod kernels {
                     // BUG FIX: Same cluster_size division as the initial tile. CLC returns a
                     // raw first_ctaid_x which represents the first CTA in the stolen cluster
                     // pair. Divide by 2 to get the tile index.
-                    let first_stolen = clc_query_get_first_ctaid_x(resp_lo, resp_hi);
                     let tile_idx = first_stolen / 2;
-                    let tile_m = tile_idx % tiles_m;
-                    let tile_n = tile_idx / tiles_m;
+                    // Same cache-blocking swizzle as the initial tile (see above).
+                    let tiles_n = _tiles_n;
+                    let group_tiles = SWIZZLE_G * tiles_m;
+                    let group = tile_idx / group_tiles;
+                    let in_group = tile_idx % group_tiles;
+                    let n_start = group * SWIZZLE_G;
+                    let band_w = if SWIZZLE_G < tiles_n - n_start {
+                        SWIZZLE_G
+                    } else {
+                        tiles_n - n_start
+                    };
+                    let tile_m = in_group / band_w;
+                    let tile_n = n_start + in_group % band_w;
 
                     if is_lane0 {
+                        while !mbarrier_try_wait_parity(
+                            &raw const TILE_INFO_FREE,
+                            tile_info_free_parity,
+                        ) {}
+                        tile_info_free_parity ^= 1;
                         *(&raw mut TILE_INFO as *mut u32).add(0) = tile_m;
                         *(&raw mut TILE_INFO as *mut u32).add(1) = tile_n;
                         *(&raw mut TILE_INFO as *mut u32).add(2) = 1;
@@ -3392,6 +3831,10 @@ mod kernels {
                         };
 
                         while !mbarrier_try_wait_parity(mma_bar_const, mma_parity) {}
+                        // All lanes wait, then sync before lane 0 issues the
+                        // loads that let MMA re-arm this barrier
+                        // (no-stranding rule).
+                        warp::sync_mask(u32::MAX);
 
                         if is_lane0 {
                             if elect_one_cta {
@@ -3440,6 +3883,10 @@ mod kernels {
                     tile_parity ^= 1;
 
                     let has_work = *(&raw const TILE_INFO as *const u32).add(2);
+                    warp::sync_mask(u32::MAX);
+                    if is_lane0 {
+                        mbarrier_arrive(&raw const TILE_INFO_FREE);
+                    }
                     if has_work == 0 {
                         break;
                     }
@@ -3447,6 +3894,10 @@ mod kernels {
                     let accum_stage = tile_iter % NUM_ACCUM_STAGES;
                     let tmem_stage_offset = accum_stage * ACCUM_STAGE_COLS;
 
+                    // All leader-warp lanes may wait here: the next ACCUM_EMPTY
+                    // phase needs an ACCUM_FULL commit from a later tile, which
+                    // sits behind this warp's tile-top sync, so the barrier
+                    // cannot advance past a lane that is still waiting on it.
                     if elect_one_cta && tile_iter >= NUM_ACCUM_STAGES {
                         let empty_parity = ((tile_iter - NUM_ACCUM_STAGES) / NUM_ACCUM_STAGES) & 1;
                         if accum_stage == 0 {
@@ -3460,9 +3911,14 @@ mod kernels {
 
                     let tile_k_base = tile_iter * k_iters;
                     let mut k_idx: u32 = 0;
+                    // Unroll one full pipeline cycle. The launch contract guarantees
+                    // k_iters % 4 == 0, so the producer's global stage and this local
+                    // stage agree at every tile boundary. Keeping this expression
+                    // loop-local lets the unroll pass fold each stage match.
+                    #[unroll(4)]
                     while k_idx < k_iters {
                         let global_k = tile_k_base + k_idx;
-                        let stage = global_k & 3;
+                        let stage = k_idx & 3;
                         let tma_parity = (global_k >> 2) & 1;
 
                         let (smem_a_base, smem_b_base, tma_bar_const, mma_bar_mut): (
@@ -3472,26 +3928,26 @@ mod kernels {
                             *mut Barrier,
                         ) = match stage {
                             0 => (
-                                &raw const SMEM_A0 as u64,
-                                &raw const SMEM_B0 as u64,
+                                cvta_generic_to_shared_offset(&raw const SMEM_A0 as *const u8),
+                                cvta_generic_to_shared_offset(&raw const SMEM_B0 as *const u8),
                                 &raw const TMA_BAR0 as *const Barrier,
                                 &raw mut MMA_BAR0 as *mut Barrier,
                             ),
                             1 => (
-                                &raw const SMEM_A1 as u64,
-                                &raw const SMEM_B1 as u64,
+                                cvta_generic_to_shared_offset(&raw const SMEM_A1 as *const u8),
+                                cvta_generic_to_shared_offset(&raw const SMEM_B1 as *const u8),
                                 &raw const TMA_BAR1 as *const Barrier,
                                 &raw mut MMA_BAR1 as *mut Barrier,
                             ),
                             2 => (
-                                &raw const SMEM_A2 as u64,
-                                &raw const SMEM_B2 as u64,
+                                cvta_generic_to_shared_offset(&raw const SMEM_A2 as *const u8),
+                                cvta_generic_to_shared_offset(&raw const SMEM_B2 as *const u8),
                                 &raw const TMA_BAR2 as *const Barrier,
                                 &raw mut MMA_BAR2 as *mut Barrier,
                             ),
                             _ => (
-                                &raw const SMEM_A3 as u64,
-                                &raw const SMEM_B3 as u64,
+                                cvta_generic_to_shared_offset(&raw const SMEM_A3 as *const u8),
+                                cvta_generic_to_shared_offset(&raw const SMEM_B3 as *const u8),
                                 &raw const TMA_BAR3 as *const Barrier,
                                 &raw mut MMA_BAR3 as *mut Barrier,
                             ),
@@ -3500,11 +3956,17 @@ mod kernels {
                         // LEADER-ONLY TMA WAIT + MMA:
                         // Because TMA completions are aliased to the leader's barrier, only
                         // the leader can (and should) wait on tma_bar_const. The follower's
-                        // TMA barrier is never signaled. The follower's MMA warp simply loops
-                        // through the K iterations without doing work — pair-UMMA is issued
-                        // by the leader and operates on both CTAs' SMEM simultaneously.
+                        // TMA barrier is never signaled -- pair-UMMA is issued by the leader
+                        // and operates on both CTAs' SMEM simultaneously.
                         if elect_one_cta {
                             while !mbarrier_try_wait_parity(tma_bar_const, tma_parity) {}
+                            // All lanes of the leader warp wait, then sync before
+                            // lane 0 issues the MMAs whose commit re-arms this
+                            // barrier: the barrier can then never advance past a
+                            // lane still waiting on it, so no lane can strand one
+                            // parity short (the seed-0 hang in the B200 mbarrier
+                            // perturbation sweep).
+                            warp::sync_mask(u32::MAX);
 
                             if is_lane0 {
                                 let mut j: u32 = 0;
@@ -3561,19 +4023,20 @@ mod kernels {
                     tile_iter += 1;
                 }
 
-                if elect_one_cta {
-                    tcgen05_relinquish_alloc_permit_cg2();
-                }
+                tcgen05_relinquish_alloc_permit_cg2();
             }
 
             if warp_id < 4 {
+                let is_lane0 = lane_id == 0;
                 let mut epi_tile_iter: u32 = 0;
                 let mut tile_parity: u32 = 0;
 
-                let leader_accum_empty0_addr =
-                    cluster::map_shared_rank(&raw const ACCUM_EMPTY0, 0) as u64;
-                let leader_accum_empty1_addr =
-                    cluster::map_shared_rank(&raw const ACCUM_EMPTY1, 0) as u64;
+                let leader_accum_empty0_addr = cvta_generic_to_shared_offset(
+                    cluster::map_shared_rank(&raw const ACCUM_EMPTY0, 0) as *const u8,
+                );
+                let leader_accum_empty1_addr = cvta_generic_to_shared_offset(
+                    cluster::map_shared_rank(&raw const ACCUM_EMPTY1, 0) as *const u8,
+                );
 
                 const TILE_N: usize = 128;
                 let warp_row_base = (warp_id * 32) as usize;
@@ -3587,12 +4050,15 @@ mod kernels {
                     tile_parity ^= 1;
 
                     let has_work = *(&raw const TILE_INFO as *const u32).add(2);
+                    let tile_m = *(&raw const TILE_INFO as *const u32).add(0);
+                    let tile_n = *(&raw const TILE_INFO as *const u32).add(1);
+                    warp::sync_mask(u32::MAX);
+                    if is_lane0 {
+                        mbarrier_arrive(&raw const TILE_INFO_FREE);
+                    }
                     if has_work == 0 {
                         break;
                     }
-
-                    let tile_m = *(&raw const TILE_INFO as *const u32).add(0);
-                    let tile_n = *(&raw const TILE_INFO as *const u32).add(1);
 
                     let accum_stage = epi_tile_iter % NUM_ACCUM_STAGES;
                     let tmem_stage_offset = accum_stage * ACCUM_STAGE_COLS;
@@ -3629,8 +4095,8 @@ mod kernels {
                             );
                             tcgen05_load_wait();
 
-                            let p0_lo = cvt_f32x2_bf16x2(regs_a[0], regs_a[1]);
-                            let p1_lo = cvt_f32x2_bf16x2(regs_b[0], regs_b[1]);
+                            let p0_lo = cvt_bf16x2_f32(regs_a[0], regs_a[1]);
+                            let p1_lo = cvt_bf16x2_f32(regs_b[0], regs_b[1]);
                             let out_row_lo =
                                 warp_row_base + (tmem_row_block as usize * 16) + row_within_8;
                             let smem_addr_lo = (&raw mut SMEM_OUT as *mut u8).add(
@@ -3640,8 +4106,8 @@ mod kernels {
                             );
                             stmatrix_m8n8_x2(smem_addr_lo, p0_lo, p1_lo);
 
-                            let p0_hi = cvt_f32x2_bf16x2(regs_a[2], regs_a[3]);
-                            let p1_hi = cvt_f32x2_bf16x2(regs_b[2], regs_b[3]);
+                            let p0_hi = cvt_bf16x2_f32(regs_a[2], regs_a[3]);
+                            let p1_hi = cvt_bf16x2_f32(regs_b[2], regs_b[3]);
                             let out_row_hi =
                                 warp_row_base + (tmem_row_block as usize * 16) + 8 + row_within_8;
                             let smem_addr_hi = (&raw mut SMEM_OUT as *mut u8).add(
@@ -3714,7 +4180,9 @@ mod kernels {
                 mbarrier_inval(&raw mut ACCUM_EMPTY0);
                 mbarrier_inval(&raw mut ACCUM_EMPTY1);
                 mbarrier_inval(&raw mut TILE_READY);
+                mbarrier_inval(&raw mut TILE_INFO_FREE);
                 mbarrier_inval(&raw mut CLC_BAR);
+                mbarrier_inval(&raw mut CLC_READY);
             }
         }
     }
@@ -3735,36 +4203,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (major, minor) = ctx.compute_capability()?;
     println!("GPU: sm_{}{}", major, minor);
 
-    if major < 10 {
-        println!("\nWARNING: tcgen05 requires sm_100+ (Blackwell)");
+    // Optional phase filter for isolating CLC kernels while debugging. The normal
+    // no-variable path below still runs the complete benchmark suite.
+    let phase_filter = std::env::var("GEMM_SOL_PHASE").ok();
+
+    // Run the cublasLt baseline once up front so the ~25s measurement isn't
+    // sandwiched between benchmark prints. Skipped silently if the bench
+    // binary isn't built (the per-phase reports will omit the % SoL column).
+    if phase_filter.is_none() {
+        cublas_baseline::warmup();
+    }
+
+    // Gate on the GPUs that can actually execute this module BEFORE trying
+    // to load it (same set as gemm_sol_final; keep in sync with
+    // mir-importer's tcgen05 target support). Deciding "wrong GPU" from a
+    // module-load failure is not sound: the driver reports arch-incompatible
+    // PTX and genuinely malformed PTX with the same CUDA_ERROR_INVALID_PTX,
+    // so a load-error fallback silently converts compiler bugs (e.g.
+    // `.global` initializers referencing `.shared` symbols) into a
+    // PTX-only "pass".
+    if !can_execute_tcgen05_ptx(major, minor) {
+        println!("\nWARNING: tcgen05 requires sm_100 (datacenter Blackwell)");
+        if major >= 10 {
+            println!(
+                "   Your GPU is sm_{}{} (consumer Blackwell has no tcgen05).",
+                major, minor
+            );
+        } else {
+            println!("   Your GPU is sm_{}{} (pre-Blackwell).", major, minor);
+        }
+        println!("   PTX was generated successfully; run on sm_100 to execute kernels.");
         return verify_ptx_only();
     }
 
-    let ptx_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gemm_sol.ptx");
-    println!("Loading PTX: {}", ptx_path.display());
-    let ptx_str = ptx_path.to_str().ok_or("PTX path must be valid UTF-8")?;
-    let module = match ctx.load_module_from_file(ptx_str) {
+    let module = match kernels::load(&ctx) {
         Ok(m) => m,
         Err(e) => {
-            if e.0 == cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_PTX {
-                println!(
-                    "\n⚠️  tcgen05 (5th gen tensor cores) requires sm_100 (datacenter Blackwell only)."
-                );
-                if major >= 10 {
-                    println!(
-                        "   Your GPU is sm_{}{} (consumer Blackwell has no tcgen05).",
-                        major, minor
-                    );
-                } else {
-                    println!("   Your GPU is sm_{}{} (pre-Blackwell).", major, minor);
-                }
-                println!("   PTX was generated successfully; run on sm_100 to execute kernels.");
-                return verify_ptx_only();
+            // This GPU passed the capability gate above, so the module must
+            // load. CUDA_ERROR_INVALID_PTX here means the driver rejected
+            // the generated PTX itself: a compiler bug, never a "wrong GPU"
+            // situation. Fail loudly instead of degrading to the PTX-only
+            // verification path.
+            let driver_status = match &e {
+                cuda_host::EmbeddedModuleError::Driver(driver) => Some(driver.0),
+                _ => None,
+            };
+            if driver_status == Some(cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_PTX) {
+                return Err(format!(
+                    "driver rejected the generated PTX as invalid on sm_{major}{minor}, \
+                     which should execute it (CUDA_ERROR_INVALID_PTX): {e:?}"
+                )
+                .into());
             }
             return Err(e.into());
         }
     };
-    let module = kernels::from_module(module).expect("Failed to initialize typed CUDA module");
     println!("PTX loaded\n");
 
     let sizes: [(usize, usize, usize); 3] = [
@@ -3773,8 +4266,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (16384, 16384, 16384),
     ];
 
-    // NOTE: Phases 1-4C temporarily skipped while developing Phase 4D.
-    // Uncomment to run all phases.
+    if let Some(phase) = phase_filter.as_deref() {
+        match phase {
+            "4a-correctness" => {
+                run_correctness_test_persistent(&stream, &module, 4096, 4096, 4096)?;
+            }
+            "4a" => {
+                run_correctness_test_persistent(&stream, &module, 4096, 4096, 4096)?;
+                for (m, n, k) in sizes {
+                    run_benchmark_persistent(&stream, &module, m, n, k)?;
+                }
+            }
+            "4b-correctness" => {
+                run_correctness_test_clc(&stream, &module, 4096, 4096, 4096)?;
+            }
+            "4b" => {
+                run_correctness_test_clc(&stream, &module, 4096, 4096, 4096)?;
+                for (m, n, k) in sizes {
+                    run_benchmark_clc(&stream, &module, m, n, k)?;
+                }
+            }
+            "4c-correctness" => {
+                run_correctness_test_clc_multicast(&stream, &module, 4096, 4096, 4096)?;
+            }
+            "4c" => {
+                run_correctness_test_clc_multicast(&stream, &module, 4096, 4096, 4096)?;
+                for (m, n, k) in sizes {
+                    run_benchmark_clc_multicast(&stream, &module, m, n, k)?;
+                }
+            }
+            "4d-correctness" => {
+                run_correctness_test_clc_multicast_4_stage_pipeline(
+                    &stream, &module, 4096, 4096, 4096,
+                )?;
+            }
+            "4d" => {
+                run_correctness_test_clc_multicast_4_stage_pipeline(
+                    &stream, &module, 4096, 4096, 4096,
+                )?;
+                for (m, n, k) in sizes {
+                    run_benchmark_clc_multicast_4_stage_pipeline(&stream, &module, m, n, k)?;
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "unknown GEMM_SOL_PHASE={phase:?}; expected 4a, 4a-correctness, 4b, \
+                     4b-correctness, 4c, 4c-correctness, 4d, or 4d-correctness"
+                )
+                .into());
+            }
+        }
+        return Ok(());
+    }
+
+    // Run the complete suite by default. GEMM_SOL_PHASE above can isolate a CLC
+    // phase for targeted correctness and repeated-launch testing.
     if true {
         // ── Phase 1: K-loop + grid tiling ──
         println!("\n\n═══════════════════════════════════════════════════════");
@@ -3899,7 +4445,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-    } // end if false — re-enable after Phase 4D is working
+    } // end all phases
 
     println!("\n═══════════════════════════════════════════════════════");
     println!("  GEMM SoL — All Phases Complete");
@@ -4209,15 +4755,9 @@ fn run_benchmark(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    // Reference: cublasLtMatmul SoL on B200 (from bench/cublaslt_bench.c)
-    // FP16 input, FP32 compute, TN format, 32MB workspace.
-    // B200 (sm_100, 148 SMs): 4K=1502, 8K=1402, 16K=1526 TFLOPS.
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS SoL is now measured live via bench/cublaslt_bench (parsed by
+    // the cublas_baseline module). The comparison line is printed by
+    // print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!("  BENCHMARK: gemm_sol {}x{}x{} f16 -> bf16", m, n, k);
@@ -4234,10 +4774,7 @@ fn run_benchmark(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())
@@ -4486,15 +5023,9 @@ fn run_benchmark_swizzled(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    // Reference: cublasLtMatmul SoL on B200 (from bench/cublaslt_bench.c)
-    // FP16 input, FP32 compute, TN format, 32MB workspace.
-    // B200 (sm_100, 148 SMs): 4K=1502, 8K=1402, 16K=1526 TFLOPS.
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS SoL is now measured live via bench/cublaslt_bench (parsed by
+    // the cublas_baseline module). The comparison line is printed by
+    // print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!(
@@ -4515,10 +5046,7 @@ fn run_benchmark_swizzled(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())
@@ -4764,15 +5292,9 @@ fn run_benchmark_pipelined(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    // Reference: cublasLtMatmul SoL on B200 (from bench/cublaslt_bench.c)
-    // FP16 input, FP32 compute, TN format, 32MB workspace.
-    // B200 (sm_100, 148 SMs): 4K=1502, 8K=1402, 16K=1526 TFLOPS.
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS SoL is now measured live via bench/cublaslt_bench (parsed by
+    // the cublas_baseline module). The comparison line is printed by
+    // print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!(
@@ -4793,10 +5315,7 @@ fn run_benchmark_pipelined(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())
@@ -5041,15 +5560,9 @@ fn run_benchmark_warp_spec(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    // Reference: cublasLtMatmul SoL on B200 (from bench/cublaslt_bench.c)
-    // FP16 input, FP32 compute, TN format, 32MB workspace.
-    // B200 (sm_100, 148 SMs): 4K=1502, 8K=1402, 16K=1526 TFLOPS.
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS SoL is now measured live via bench/cublaslt_bench (parsed by
+    // the cublas_baseline module). The comparison line is printed by
+    // print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!(
@@ -5070,10 +5583,7 @@ fn run_benchmark_warp_spec(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())
@@ -5311,7 +5821,7 @@ fn run_benchmark_persistent(
     for _ in 0..WARMUP {
         let z = 0u32;
         unsafe {
-            cuda_core::memory::memcpy_htod_async(
+            cuda_core::simt::memory::memcpy_htod_async(
                 dev_tile_counter.cu_deviceptr(),
                 &z as *const u32,
                 std::mem::size_of::<u32>(),
@@ -5341,7 +5851,7 @@ fn run_benchmark_persistent(
     for _ in 0..ITERS {
         let z = 0u32;
         unsafe {
-            cuda_core::memory::memcpy_htod_async(
+            cuda_core::simt::memory::memcpy_htod_async(
                 dev_tile_counter.cu_deviceptr(),
                 &z as *const u32,
                 std::mem::size_of::<u32>(),
@@ -5373,15 +5883,9 @@ fn run_benchmark_persistent(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    // Reference: cublasLtMatmul SoL on B200 (from bench/cublaslt_bench.c)
-    // FP16 input, FP32 compute, TN format, 32MB workspace.
-    // B200 (sm_100, 148 SMs): 4K=1502, 8K=1402, 16K=1526 TFLOPS.
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS SoL is now measured live via bench/cublaslt_bench (parsed by
+    // the cublas_baseline module). The comparison line is printed by
+    // print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!(
@@ -5400,11 +5904,190 @@ fn run_benchmark_persistent(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
+
+    Ok(())
+}
+
+// A 12-bit Walsh fingerprint gives every row and column in the fixed 4096²
+// validator a unique whole-vector signature while retaining an O(MK + NK + MN)
+// analytic reference. The odd affine multipliers are permutations mod 4096.
+const VALIDATION_CODE_COUNT: usize = 1 << 12;
+const VALIDATION_CODE_MASK: u32 = VALIDATION_CODE_COUNT as u32 - 1;
+
+#[inline]
+fn validation_affine12(x: usize, multiplier: u32, addend: u32) -> u32 {
+    ((x as u32).wrapping_mul(multiplier).wrapping_add(addend)) & VALIDATION_CODE_MASK
+}
+
+#[inline]
+fn validation_k_code(kk: usize) -> u32 {
+    validation_affine12(kk, 251, 17)
+}
+
+#[inline]
+fn validation_row_code(row: usize) -> u32 {
+    validation_affine12(row, 197, 101)
+}
+
+#[inline]
+fn validation_col_code(col: usize) -> u32 {
+    validation_affine12(col, 109, 1021)
+}
+
+#[inline]
+fn validation_fingerprint(position_code: u32, kk: usize) -> f32 {
+    let distance = (position_code ^ validation_k_code(kk)).count_ones() as i32;
+    (13 - 2 * distance) as f32
+}
+
+#[inline]
+fn validation_a_value(row: usize, kk: usize) -> f32 {
+    // The quadrant scale breaks the affine-code twin symmetry: since
+    // code(x + 2048) = code(x) ^ 0x800, the XOR-based expected values would
+    // otherwise be invariant under (row, col) -> (row + 2048, col + 2048),
+    // giving every 128x128 output tile a byte-identical twin 16 tiles away
+    // on both axes — exactly the tile-permutation blindness this validator
+    // exists to remove. Doubling the top half of A keeps every value an
+    // exact small f16 integer while making twin tiles differ everywhere
+    // (scores are odd, so never zero).
+    let quadrant_scale = (1 + (row >> 11)) as f32;
+    quadrant_scale * validation_fingerprint(validation_row_code(row), kk)
+}
+
+#[inline]
+fn validation_b_value(col: usize, kk: usize) -> f32 {
+    validation_fingerprint(validation_col_code(col), kk)
+}
+
+/// Builds the Walsh-fingerprint A/B inputs for the fixed 4096³ CLC correctness
+/// contract. Every row of A and column of B carries a unique whole-vector
+/// signature, so tile-permutation failures (stale TILE_INFO work-ids, tile
+/// swaps between readers, wrong accumulators) produce output bytes that cannot
+/// match the analytic reference — unlike periodic inputs, where all 128×128
+/// output tiles are byte-identical.
+fn validation_build_inputs(m: usize, n: usize, k: usize) -> (Vec<u16>, Vec<u16>) {
+    assert_eq!(
+        [m, n, k],
+        [VALIDATION_CODE_COUNT; 3],
+        "the bit-exact Walsh validator is defined for the fixed 4096³ contract"
+    );
+
+    let mut host_a: Vec<u16> = vec![0u16; m * k];
+    for i in 0..m {
+        for kk in 0..k {
+            host_a[i * k + kk] = f16::from_f32(validation_a_value(i, kk)).to_bits();
+        }
+    }
+    let mut host_b: Vec<u16> = vec![0u16; n * k];
+    for j in 0..n {
+        for kk in 0..k {
+            host_b[j * k + kk] = f16::from_f32(validation_b_value(j, kk)).to_bits();
+        }
+    }
+
+    println!(
+        "Validation data: 12-bit Walsh fingerprints varying along K and covering \
+         each K code once, with unique signatures for all {} rows and columns",
+        VALIDATION_CODE_COUNT
+    );
+    println!("Expected: analytic exact FP32 dot product rounded once to BF16\n");
+
+    (host_a, host_b)
+}
+
+/// Full-output correctness check: compares EVERY BF16 element against the
+/// exact rounded reference, not a sampled subset. The fingerprints are small
+/// signed integers, so every FP32 product and partial sum is exact in any
+/// accumulation order (magnitudes stay far below 2^24) and a correct kernel
+/// must match the reference BF16 bits.
+fn validation_check_full_output(
+    kernel_name: &str,
+    host_output: &[u32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Walsh orthogonality gives C[row,col] = scale(row) * K * (13 - 2 *
+    // HammingDistance) for each row/column code pair, where scale is the
+    // quadrant scale from validation_a_value (1 for rows 0..2047, 2 above).
+    // Cache 4096 XOR-indexed entries per row half; K * score * scale keeps
+    // at most 5 significant bits, so both are exact in BF16.
+    let expected_by_xor: Vec<[u16; 2]> = (0..VALIDATION_CODE_COUNT)
+        .map(|difference| {
+            let score = 13 - 2 * (difference as u32).count_ones() as i64;
+            let fp32 = (k as i64 * score) as f32;
+            [
+                bf16::from_f32(fp32).to_bits(),
+                bf16::from_f32(2.0 * fp32).to_bits(),
+            ]
+        })
+        .collect();
+
+    let expected_bits = |row: usize, col: usize| -> u16 {
+        expected_by_xor[(validation_row_code(row) ^ validation_col_code(col)) as usize][row >> 11]
+    };
+    let read_c_bits = |row: usize, col: usize| -> u16 {
+        let packed = host_output[row * (n / 2) + col / 2];
+        if col.is_multiple_of(2) {
+            packed as u16
+        } else {
+            (packed >> 16) as u16
+        }
+    };
+
+    let mut mismatches: u64 = 0;
+    let mut first_bad: Option<(usize, usize, f32, f32)> = None;
+    let mut max_rel_err: f32 = 0.0;
+    for row in 0..m {
+        for col in 0..n {
+            let val_bits = read_c_bits(row, col);
+            let exp_bits = expected_bits(row, col);
+            let val = bf16_to_f32(val_bits);
+            let exp = bf16_to_f32(exp_bits);
+            let diff = (val - exp).abs();
+            let rel = diff / (exp.abs() + 1.0);
+            if rel > max_rel_err {
+                max_rel_err = rel;
+            }
+            if val_bits != exp_bits {
+                mismatches += 1;
+                if first_bad.is_none() {
+                    first_bad = Some((row, col, val, exp));
+                }
+            }
+        }
+    }
+    let total = (m * n) as u64;
+    println!(
+        "\nFull check: {} / {} exact BF16 matches (max rel err {:.4})",
+        total - mismatches,
+        total,
+        max_rel_err
+    );
+    if let Some((r, c, val, exp)) = first_bad {
+        println!(
+            "  first mismatch: C[{},{}] = {} (expected {})",
+            r, c, val, exp
+        );
+    }
+
+    println!("\n═══════════════════════════════════════════════════════");
+    if mismatches == 0 {
+        println!(
+            "PASSED: {} {}x{}x{} (full {}-element check)",
+            kernel_name, m, n, k, total
+        );
+    } else {
+        println!("FAILED: {} {}x{}x{}", kernel_name, m, n, k);
+        return Err(format!(
+            "Correctness check failed: {} / {} elements wrong",
+            mismatches, total
+        )
+        .into());
+    }
+    println!("═══════════════════════════════════════════════════════");
 
     Ok(())
 }
@@ -5422,23 +6105,7 @@ fn run_correctness_test_clc(
     println!("CLC tile scheduling + TMEM accum pipeline.");
     println!("Warps: 4=TMA, 5=MMA, 0-3=epilogue.");
 
-    let mut host_a: Vec<u16> = vec![0u16; m * k];
-    for i in 0..m {
-        let val = f16::from_f32((i % 8 + 1) as f32).to_bits();
-        for kk in 0..k {
-            host_a[i * k + kk] = val;
-        }
-    }
-    let mut host_b: Vec<u16> = vec![0u16; n * k];
-    for j in 0..n {
-        let val = f16::from_f32((j % 8 + 1) as f32).to_bits();
-        for kk in 0..k {
-            host_b[j * k + kk] = val;
-        }
-    }
-
-    println!("A[i,k] = (i%8+1), B[n,k] = (n%8+1)");
-    println!("Expected: C[i,j] = (i%8+1)*(j%8+1)*K\n");
+    let (host_a, host_b) = validation_build_inputs(m, n, k);
 
     let dev_a = DeviceBuffer::from_host(stream, &host_a)?;
     let dev_b = DeviceBuffer::from_host(stream, &host_b)?;
@@ -5504,92 +6171,7 @@ fn run_correctness_test_clc(
 
     let host_output: Vec<u32> = dev_output.to_host_vec(stream)?;
 
-    let expected = |row: usize, col: usize| -> f32 { ((row % 8 + 1) * (col % 8 + 1) * k) as f32 };
-    let read_c = |row: usize, col: usize| -> f32 {
-        let packed_idx = row * (n / 2) + col / 2;
-        let packed = host_output[packed_idx];
-        let (lo, hi) = unpack_bf16_pair(packed);
-        if col.is_multiple_of(2) { lo } else { hi }
-    };
-
-    let check_positions = [
-        (0, 0),
-        (0, n - 1),
-        (m - 1, 0),
-        (m - 1, n - 1),
-        (m / 2, n / 2),
-        (3, 5),
-        (7, 7),
-        (127, 127),
-    ];
-
-    let mut all_ok = true;
-    println!("\nSpot checks:");
-    for (row, col) in check_positions {
-        let val = read_c(row, col);
-        let exp = expected(row, col);
-        let ok = (val - exp).abs() < (exp * 0.02 + 1.0);
-        println!(
-            "  C[{:>4},{:>4}] = {:>10.0}  (expected {:>10.0})  {}",
-            row,
-            col,
-            val,
-            exp,
-            if ok { "OK" } else { "FAIL" }
-        );
-        if !ok {
-            all_ok = false;
-        }
-    }
-
-    let mut zero_tiles = 0u32;
-    let tiles_m_val = m / 128;
-    let tiles_n_val = n / 128;
-    for tm in 0..tiles_m_val {
-        for tn in 0..tiles_n_val {
-            let row = tm * 128 + 64;
-            let col = tn * 128 + 64;
-            let val = read_c(row, col);
-            if val.abs() < 1.0 {
-                zero_tiles += 1;
-                all_ok = false;
-            }
-        }
-    }
-    if zero_tiles > 0 {
-        println!(
-            "  Zero tiles: {} / {}",
-            zero_tiles,
-            tiles_m_val * tiles_n_val
-        );
-    }
-
-    let mut first_row_sum: f64 = 0.0;
-    for col_pair in 0..(n / 2) {
-        let packed = host_output[col_pair];
-        let (lo, hi) = unpack_bf16_pair(packed);
-        first_row_sum += lo as f64 + hi as f64;
-    }
-    let expected_row_sum = k as f64 * (n as f64 / 8.0) * 36.0;
-    let row_sum_ok =
-        (first_row_sum - expected_row_sum).abs() < (expected_row_sum * 0.02 + n as f64);
-    println!(
-        "\n  Row 0 sum: {:.0} (expected {:.0}) {}",
-        first_row_sum,
-        expected_row_sum,
-        if row_sum_ok { "OK" } else { "FAIL" }
-    );
-
-    println!("\n═══════════════════════════════════════════════════════");
-    if all_ok && row_sum_ok {
-        println!("PASSED: gemm_sol_clc {}x{}x{}", m, n, k);
-    } else {
-        println!("FAILED: gemm_sol_clc {}x{}x{}", m, n, k);
-        return Err("Correctness check failed".into());
-    }
-    println!("═══════════════════════════════════════════════════════");
-
-    Ok(())
+    validation_check_full_output("gemm_sol_clc", &host_output, m, n, k)
 }
 
 fn run_benchmark_clc(
@@ -5682,15 +6264,9 @@ fn run_benchmark_clc(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    // Reference: cublasLtMatmul SoL on B200 (from bench/cublaslt_bench.c)
-    // FP16 input, FP32 compute, TN format, 32MB workspace.
-    // B200 (sm_100, 148 SMs): 4K=1502, 8K=1402, 16K=1526 TFLOPS.
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS SoL is now measured live via bench/cublaslt_bench (parsed by
+    // the cublas_baseline module). The comparison line is printed by
+    // print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!("  BENCHMARK: gemm_sol_clc {}x{}x{} f16 -> bf16", m, n, k);
@@ -5706,10 +6282,7 @@ fn run_benchmark_clc(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())
@@ -5728,23 +6301,7 @@ fn run_correctness_test_clc_multicast(
     println!("CLC + TMA multicast for B tiles + TMEM accum pipeline.");
     println!("Warps: 4=TMA, 5=MMA, 0-3=epilogue.");
 
-    let mut host_a: Vec<u16> = vec![0u16; m * k];
-    for i in 0..m {
-        let val = f16::from_f32((i % 8 + 1) as f32).to_bits();
-        for kk in 0..k {
-            host_a[i * k + kk] = val;
-        }
-    }
-    let mut host_b: Vec<u16> = vec![0u16; n * k];
-    for j in 0..n {
-        let val = f16::from_f32((j % 8 + 1) as f32).to_bits();
-        for kk in 0..k {
-            host_b[j * k + kk] = val;
-        }
-    }
-
-    println!("A[i,k] = (i%8+1), B[n,k] = (n%8+1)");
-    println!("Expected: C[i,j] = (i%8+1)*(j%8+1)*K\n");
+    let (host_a, host_b) = validation_build_inputs(m, n, k);
 
     let dev_a = DeviceBuffer::from_host(stream, &host_a)?;
     let dev_b = DeviceBuffer::from_host(stream, &host_b)?;
@@ -5810,92 +6367,7 @@ fn run_correctness_test_clc_multicast(
 
     let host_output: Vec<u32> = dev_output.to_host_vec(stream)?;
 
-    let expected = |row: usize, col: usize| -> f32 { ((row % 8 + 1) * (col % 8 + 1) * k) as f32 };
-    let read_c = |row: usize, col: usize| -> f32 {
-        let packed_idx = row * (n / 2) + col / 2;
-        let packed = host_output[packed_idx];
-        let (lo, hi) = unpack_bf16_pair(packed);
-        if col.is_multiple_of(2) { lo } else { hi }
-    };
-
-    let check_positions = [
-        (0, 0),
-        (0, n - 1),
-        (m - 1, 0),
-        (m - 1, n - 1),
-        (m / 2, n / 2),
-        (3, 5),
-        (7, 7),
-        (127, 127),
-    ];
-
-    let mut all_ok = true;
-    println!("\nSpot checks:");
-    for (row, col) in check_positions {
-        let val = read_c(row, col);
-        let exp = expected(row, col);
-        let ok = (val - exp).abs() < (exp * 0.02 + 1.0);
-        println!(
-            "  C[{:>4},{:>4}] = {:>10.0}  (expected {:>10.0})  {}",
-            row,
-            col,
-            val,
-            exp,
-            if ok { "OK" } else { "FAIL" }
-        );
-        if !ok {
-            all_ok = false;
-        }
-    }
-
-    let mut zero_tiles = 0u32;
-    let tiles_m_val = m / 128;
-    let tiles_n_val = n / 128;
-    for tm in 0..tiles_m_val {
-        for tn in 0..tiles_n_val {
-            let row = tm * 128 + 64;
-            let col = tn * 128 + 64;
-            let val = read_c(row, col);
-            if val.abs() < 1.0 {
-                zero_tiles += 1;
-                all_ok = false;
-            }
-        }
-    }
-    if zero_tiles > 0 {
-        println!(
-            "  Zero tiles: {} / {}",
-            zero_tiles,
-            tiles_m_val * tiles_n_val
-        );
-    }
-
-    let mut first_row_sum: f64 = 0.0;
-    for col_pair in 0..(n / 2) {
-        let packed = host_output[col_pair];
-        let (lo, hi) = unpack_bf16_pair(packed);
-        first_row_sum += lo as f64 + hi as f64;
-    }
-    let expected_row_sum = k as f64 * (n as f64 / 8.0) * 36.0;
-    let row_sum_ok =
-        (first_row_sum - expected_row_sum).abs() < (expected_row_sum * 0.02 + n as f64);
-    println!(
-        "\n  Row 0 sum: {:.0} (expected {:.0}) {}",
-        first_row_sum,
-        expected_row_sum,
-        if row_sum_ok { "OK" } else { "FAIL" }
-    );
-
-    println!("\n═══════════════════════════════════════════════════════");
-    if all_ok && row_sum_ok {
-        println!("PASSED: gemm_sol_clc_multicast {}x{}x{}", m, n, k);
-    } else {
-        println!("FAILED: gemm_sol_clc_multicast {}x{}x{}", m, n, k);
-        return Err("Correctness check failed".into());
-    }
-    println!("═══════════════════════════════════════════════════════");
-
-    Ok(())
+    validation_check_full_output("gemm_sol_clc_multicast", &host_output, m, n, k)
 }
 
 fn run_benchmark_clc_multicast(
@@ -5988,12 +6460,7 @@ fn run_benchmark_clc_multicast(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS comparison is printed by print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!(
@@ -6012,10 +6479,7 @@ fn run_benchmark_clc_multicast(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())
@@ -6028,29 +6492,13 @@ fn run_correctness_test_clc_multicast_4_stage_pipeline(
     n: usize,
     k: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    assert!(m.is_multiple_of(256) && n.is_multiple_of(128) && k.is_multiple_of(64));
+    assert!(m.is_multiple_of(256) && n.is_multiple_of(128) && k.is_multiple_of(256));
 
     println!("Matrix: {}x{}x{} (f16 -> bf16)", m, n, k);
     println!("CLC + cta_group::2 + 4-stage SMEM pipeline.");
     println!("Warps: 4=TMA, 5=MMA (leader only), 0-3=epilogue (both CTAs).");
 
-    let mut host_a: Vec<u16> = vec![0u16; m * k];
-    for i in 0..m {
-        let val = f16::from_f32((i % 8 + 1) as f32).to_bits();
-        for kk in 0..k {
-            host_a[i * k + kk] = val;
-        }
-    }
-    let mut host_b: Vec<u16> = vec![0u16; n * k];
-    for j in 0..n {
-        let val = f16::from_f32((j % 8 + 1) as f32).to_bits();
-        for kk in 0..k {
-            host_b[j * k + kk] = val;
-        }
-    }
-
-    println!("A[i,k] = (i%8+1), B[n,k] = (n%8+1)");
-    println!("Expected: C[i,j] = (i%8+1)*(j%8+1)*K\n");
+    let (host_a, host_b) = validation_build_inputs(m, n, k);
 
     let dev_a = DeviceBuffer::from_host(stream, &host_a)?;
     let dev_b = DeviceBuffer::from_host(stream, &host_b)?;
@@ -6122,98 +6570,13 @@ fn run_correctness_test_clc_multicast_4_stage_pipeline(
 
     let host_output: Vec<u32> = dev_output.to_host_vec(stream)?;
 
-    let expected = |row: usize, col: usize| -> f32 { ((row % 8 + 1) * (col % 8 + 1) * k) as f32 };
-    let read_c = |row: usize, col: usize| -> f32 {
-        let packed_idx = row * (n / 2) + col / 2;
-        let packed = host_output[packed_idx];
-        let (lo, hi) = unpack_bf16_pair(packed);
-        if col.is_multiple_of(2) { lo } else { hi }
-    };
-
-    let check_positions = [
-        (0, 0),
-        (0, n - 1),
-        (m - 1, 0),
-        (m - 1, n - 1),
-        (m / 2, n / 2),
-        (3, 5),
-        (7, 7),
-        (127, 127),
-    ];
-
-    let mut all_ok = true;
-    println!("\nSpot checks:");
-    for (row, col) in check_positions {
-        let val = read_c(row, col);
-        let exp = expected(row, col);
-        let ok = (val - exp).abs() < (exp * 0.02 + 1.0);
-        println!(
-            "  C[{:>4},{:>4}] = {:>10.0}  (expected {:>10.0})  {}",
-            row,
-            col,
-            val,
-            exp,
-            if ok { "OK" } else { "FAIL" }
-        );
-        if !ok {
-            all_ok = false;
-        }
-    }
-
-    let mut zero_tiles = 0u32;
-    let tiles_m_val = m / 128;
-    let tiles_n_val = n / 128;
-    for tm in 0..tiles_m_val {
-        for tn in 0..tiles_n_val {
-            let row = tm * 128 + 64;
-            let col = tn * 128 + 64;
-            let val = read_c(row, col);
-            if val.abs() < 1.0 {
-                zero_tiles += 1;
-                all_ok = false;
-            }
-        }
-    }
-    if zero_tiles > 0 {
-        println!(
-            "  Zero tiles: {} / {}",
-            zero_tiles,
-            tiles_m_val * tiles_n_val
-        );
-    }
-
-    let mut first_row_sum: f64 = 0.0;
-    for col_pair in 0..(n / 2) {
-        let packed = host_output[col_pair];
-        let (lo, hi) = unpack_bf16_pair(packed);
-        first_row_sum += lo as f64 + hi as f64;
-    }
-    let expected_row_sum = k as f64 * (n as f64 / 8.0) * 36.0;
-    let row_sum_ok =
-        (first_row_sum - expected_row_sum).abs() < (expected_row_sum * 0.02 + n as f64);
-    println!(
-        "\n  Row 0 sum: {:.0} (expected {:.0}) {}",
-        first_row_sum,
-        expected_row_sum,
-        if row_sum_ok { "OK" } else { "FAIL" }
-    );
-
-    println!("\n═══════════════════════════════════════════════════════");
-    if all_ok && row_sum_ok {
-        println!(
-            "PASSED: gemm_sol_clc_multicast_4_stage_pipeline {}x{}x{}",
-            m, n, k
-        );
-    } else {
-        println!(
-            "FAILED: gemm_sol_clc_multicast_4_stage_pipeline {}x{}x{}",
-            m, n, k
-        );
-        return Err("Correctness check failed".into());
-    }
-    println!("═══════════════════════════════════════════════════════");
-
-    Ok(())
+    validation_check_full_output(
+        "gemm_sol_clc_multicast_4_stage_pipeline",
+        &host_output,
+        m,
+        n,
+        k,
+    )
 }
 
 fn run_benchmark_clc_multicast_4_stage_pipeline(
@@ -6226,7 +6589,7 @@ fn run_benchmark_clc_multicast_4_stage_pipeline(
     const WARMUP: usize = 10;
     const ITERS: usize = 100;
 
-    assert!(m.is_multiple_of(256) && n.is_multiple_of(128) && k.is_multiple_of(64));
+    assert!(m.is_multiple_of(256) && n.is_multiple_of(128) && k.is_multiple_of(256));
 
     let dev_a = DeviceBuffer::<u16>::zeroed(stream, m * k)?;
     let dev_b = DeviceBuffer::<u16>::zeroed(stream, n * k)?;
@@ -6311,12 +6674,7 @@ fn run_benchmark_clc_multicast_4_stage_pipeline(
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = (flops / (avg_ms / 1000.0)) / 1e12;
 
-    let cublas_sol_tflops = match m {
-        8192 => 1402.0_f64,
-        16384 => 1526.0_f64,
-        _ => 1502.0_f64,
-    };
-    let pct_sol = (tflops / cublas_sol_tflops) * 100.0;
+    // cuBLAS comparison is printed by print_cublas_comparison(tflops, m) below.
 
     println!("═══════════════════════════════════════════════════════");
     println!(
@@ -6335,13 +6693,18 @@ fn run_benchmark_clc_multicast_4_stage_pipeline(
     println!("  Average:     {:.3} us / kernel", avg_us);
     println!("  FLOPS/kern:  {:.3e}", flops);
     println!("  Throughput:  {:.3} TFLOPS", tflops);
-    println!(
-        "  vs cuBLAS:   {:.2}% of SoL ({:.0} TFLOPS)",
-        pct_sol, cublas_sol_tflops
-    );
+    print_cublas_comparison(tflops, m);
     println!("═══════════════════════════════════════════════════════\n");
 
     Ok(())
+}
+
+// Keep this execution set in sync with mir-importer's tcgen05 target
+// support (and with gemm_sol_final's copy). Other GPU generations may
+// inspect and assemble the generated artifact, but must not turn a
+// module-load failure into an execution pass.
+fn can_execute_tcgen05_ptx(major: i32, minor: i32) -> bool {
+    matches!((major, minor), (10, 0) | (10, 1) | (10, 3) | (11, 0))
 }
 
 fn verify_ptx_only() -> Result<(), Box<dyn std::error::Error>> {
@@ -6515,8 +6878,4 @@ fn unpack_bf16_pair(packed: u32) -> (f32, f32) {
     let lo = (packed & 0xFFFF) as u16;
     let hi = ((packed >> 16) & 0xFFFF) as u16;
     (bf16_to_f32(lo), bf16_to_f32(hi))
-}
-
-fn bf16_to_f32(h: u16) -> f32 {
-    f32::from_bits((h as u32) << 16)
 }

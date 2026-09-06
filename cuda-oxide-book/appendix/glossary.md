@@ -33,14 +33,16 @@ memory via Distributed Shared Memory (DSMEM) and synchronize via
 
 The `rustc_codegen_cuda` crate — a custom rustc backend loaded as a dylib. It
 intercepts MIR during compilation, lowers it through `dialect-mir` →
-`mem2reg` → `dialect-llvm` → LLVM IR → PTX, and emits the PTX alongside the
-normal host binary.
+`mem2reg` → annotated loop unroll → LLVM dialect → LLVM IR → PTX. It emits PTX
+alongside the normal host binary.
 
 ## `cuda-async`
 
-The async execution layer. Provides `DeviceOperation` (lazy GPU work
-description), `DeviceFuture` (stream-bound execution), and `DeviceBox<T>`
-(device-owned memory). Compose work with `zip!`, `and_then`, and `value()`.
+The async execution layer, a crate shared with cutile-rs and published from
+NVlabs/cutile-rs. The cuda-oxide model lives under `cuda_async::simt`:
+`DeviceOperation` (lazy GPU work description), `DeviceFuture` (stream-bound
+execution), and `DeviceBox<T>` (device-owned memory). Compose work with
+`zip!`, `and_then`, and `value()`.
 
 ## `cuda-device`
 
@@ -52,7 +54,9 @@ cores, atomics, and debug facilities.
 
 Safe RAII wrappers around the CUDA Driver API: `CudaContext`, `CudaStream`,
 `DeviceBuffer<T>`, and module loading. Handles GPU context and memory management
-on the host side.
+on the host side. Shared with cutile-rs and published from NVlabs/cutile-rs;
+the cuda-oxide surface is re-exported at the crate root except
+`simt::LaunchConfig`, `simt::vmm`, `simt::peer`, and `simt::memory`.
 
 ## `DeviceOperation`
 
@@ -64,8 +68,8 @@ with `zip!` (parallel) and `and_then` (sequential).
 
 A safe mutable output abstraction for kernels. Accepts only a
 `ThreadIndex` whose `IndexSpace` matches its own type parameter,
-providing bounds-checked `Option<&mut T>` returns. Prevents data races
-by construction — each thread can only write to its own element. The
+providing bounds-checked `Option<&mut T>` returns. With matching prepared
+launch geometry, each thread can only write to its own element. The
 `get_mut_indexed()` shortcut mints the witness and resolves it to a
 mutable reference in a single call.
 
@@ -114,6 +118,13 @@ functions for each concrete type used. cuda-oxide fully supports
 monomorphization on device — `scale::<f32>` and `scale::<f64>` each become
 separate PTX functions.
 
+## `PreparedLaunch<K>`
+
+A reusable host-side proof that a launch configuration was checked for the
+exact kernel `K`. Generated safe methods accept this branded value. Passing a
+raw `LaunchConfig` directly to a generated method is instead unsafe because it
+does not prove the kernel's indexing or resource requirements.
+
 ## Pliron
 
 An MLIR-inspired IR framework written in Rust, used as the intermediate
@@ -156,16 +167,18 @@ An opaque witness that can only be constructed by trusted index
 functions. Three forms:
 
 - `thread::index_1d() -> ThreadIndex<'_, Index1D>`. Always returns a
-  witness; unconditionally unique per thread
-  (`threadIdx.x < blockDim.x` is hardware-enforced).
+  witness. It is unique only when block and grid Y/Z dimensions are 1;
+  a `domain = 1` prepared launch proves this.
 - `thread::index_2d::<S>() -> Option<ThreadIndex<'_, Index2D<S>>>`. The
   row stride is a const generic, so a `DisjointSlice<T, Index2D<S>>`
   only accepts a witness with the matching `S` -- mixing strides is a
   type error.
-- `unsafe thread::index_2d_runtime(s) -> Option<ThreadIndex<'_, Runtime2DIndex>>`.
-  Escape hatch when the stride is only known at launch time. The
-  `unsafe` is the contract: every thread feeding a `Runtime2DIndex`
-  into the same `DisjointSlice` must have used the same `s`.
+- `thread::index_2d_runtime(&slice) -> Option<ThreadIndex<'_, Runtime2DIndex>>`.
+  For strides only known at launch time, and safe: the row width lives
+  in the slice, written once by the host into the launch packet. The
+  witness stores the thread's `(row, col)` coordinates, and the slice
+  being addressed resolves them against its own width, so every thread
+  indexing one slice uses the same row width by construction.
 
 The witness is `!Send + !Sync + !Copy + !Clone` and `'kernel`-scoped, so
 threads cannot launder it through shared memory and it cannot outlive

@@ -136,6 +136,26 @@ mod kernels {
         f(x)
     }
 
+    #[inline(never)]
+    fn apply_once_noinline<F: FnOnce(u32) -> u32>(f: F, x: u32) -> u32 {
+        f(x)
+    }
+
+    struct ClosureWrapper<F> {
+        f: F,
+        offset: u32,
+    }
+
+    impl<F> ClosureWrapper<F>
+    where
+        F: Fn(u32) -> u32,
+    {
+        #[inline(never)]
+        fn call(&self, args: (u32,)) -> u32 {
+            (self.f)(args.0) + self.offset
+        }
+    }
+
     // Note: apply_twice with Fn trait is commented out due to control flow issues.
     // The `Fn` trait requires the closure to be called multiple times, which
     // can create complex control flow that the backend doesn't fully support yet.
@@ -190,7 +210,8 @@ mod kernels {
     //     }
     // }
 
-    /// Test: Closure with capture passed to generic function
+    /// An immutable capture implements `Fn` but is consumed through `FnOnce`;
+    /// the adapter's direct body call must synthesize an exact `&Closure`.
     #[kernel]
     pub fn test_closure_capture_fnonce(factor: u32, mut out: DisjointSlice<u32>) {
         let idx = thread::index_1d();
@@ -199,6 +220,97 @@ mod kernels {
             let scale = |x: u32| x * factor;
             let val = idx_raw as u32;
             *out_elem = apply_closure(scale, val);
+        }
+    }
+
+    /// A closure that mutates its capture implements `FnMut`, but the generic
+    /// helper consumes it through `FnOnce`. rustc inserts a ClosureOnce adapter
+    /// whose direct body call must synthesize an exact `&mut Closure` receiver.
+    #[kernel]
+    pub fn test_closure_fnmut_adapter(seed: u32, mut out: DisjointSlice<u32>) {
+        let idx = thread::index_1d();
+        let idx_raw = idx.get();
+        if let Some(out_elem) = out.get_mut(idx) {
+            let mut state = seed + idx_raw as u32;
+            let bump = |delta: u32| {
+                state += delta;
+                state
+            };
+            *out_elem = apply_closure(bump, 3);
+        }
+    }
+
+    /// Control: consuming a non-Copy capture makes this a genuine `FnOnce`.
+    /// Its closure body receives the environment by value, so bypassing the
+    /// callable-trait dispatch must not synthesize any receiver borrow.
+    #[kernel]
+    pub fn test_genuine_fnonce_receiver(seed: u32, mut out: DisjointSlice<u32>) {
+        struct Token(u32);
+        impl Token {
+            fn into_value(self) -> u32 {
+                self.0
+            }
+        }
+
+        let idx = thread::index_1d();
+        let idx_raw = idx.get();
+        if let Some(out_elem) = out.get_mut(idx) {
+            let token = Token(seed + idx_raw as u32);
+            let consume = move |delta: u32| token.into_value() + delta;
+            *out_elem = apply_once_noinline(consume, 5);
+        }
+    }
+
+    /// Wrapper method named `call` whose generic substitutions contain a
+    /// closure. This is not a closure trait shim: the receiver is the wrapper,
+    /// so the tuple argument must remain one ordinary method argument.
+    #[kernel]
+    pub fn test_wrapper_method_named_call(factor: u32, mut out: DisjointSlice<u32>) {
+        let idx = thread::index_1d();
+        let idx_raw = idx.get();
+        if let Some(out_elem) = out.get_mut(idx) {
+            let scale = |x: u32| x * factor;
+            let wrapper = ClosureWrapper {
+                f: scale,
+                offset: 1,
+            };
+            *out_elem = wrapper.call((idx_raw as u32,));
+        }
+    }
+
+    /// Genuine closure call whose receiver is reached through a struct field
+    /// (`(holder.f)(x)`). The tightened `receiver_is_closure` guard must still
+    /// unpack the rust-call tuple here: rustc materializes the `&{closure}`
+    /// receiver into its own temporary local, so the base-local type check
+    /// sees a closure even though the closure lives in a field.
+    #[kernel]
+    pub fn test_closure_field_projection(factor: u32, mut out: DisjointSlice<u32>) {
+        struct Holder<F> {
+            f: F,
+        }
+        let idx = thread::index_1d();
+        let idx_raw = idx.get();
+        if let Some(out_elem) = out.get_mut(idx) {
+            let holder = Holder {
+                f: |x: u32| x * factor,
+            };
+            *out_elem = (holder.f)(idx_raw as u32);
+        }
+    }
+
+    /// Genuine closure call through two reference levels (`(**rr)(x)`). The
+    /// guard peels a single reference; this still classifies as a closure
+    /// because rustc resolves the receiver to one `&{closure}` borrow at the
+    /// call site regardless of the source-level double indirection.
+    #[kernel]
+    pub fn test_closure_double_ref(factor: u32, mut out: DisjointSlice<u32>) {
+        let idx = thread::index_1d();
+        let idx_raw = idx.get();
+        if let Some(out_elem) = out.get_mut(idx) {
+            let closure = |x: u32| x * factor;
+            let r = &closure;
+            let rr = &r;
+            *out_elem = (**rr)(idx_raw as u32);
         }
     }
 }
@@ -210,16 +322,13 @@ mod kernels {
 fn main() {
     println!("=== Unified Compilation: Closures ===\n");
 
-    use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+    use cuda_core::simt::LaunchConfig;
+    use cuda_core::{CudaContext, DeviceBuffer};
 
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
     let stream = ctx.default_stream();
 
-    let module = ctx
-        .load_module_from_file("device_closures.ptx")
-        .expect("Failed to load PTX module");
-    let module = kernels::from_module(module).expect("Failed to initialize typed CUDA module");
-
+    let module = kernels::load(&ctx).expect("Failed to load embedded CUDA module");
     // =========================================================================
     // Test 1: Inline closure (no external captures)
     // =========================================================================
@@ -228,13 +337,15 @@ fn main() {
         const N: usize = 8;
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
 
-        module
-            .test_inline_closure(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.test_inline_closure(
                 (stream).as_ref(),
                 LaunchConfig::for_num_elems(N as u32),
                 &mut out_dev,
             )
-            .expect("Kernel launch failed");
+        }
+        .expect("Kernel launch failed");
 
         let out: Vec<u32> = out_dev.to_host_vec(&stream).unwrap();
         let expected: Vec<u32> = (0..N).map(|i| (i * 2) as u32).collect();
@@ -259,15 +370,17 @@ fn main() {
         let input_dev = DeviceBuffer::from_host(&stream, &input).unwrap();
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
 
-        module
-            .scale_kernel(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.scale_kernel(
                 (stream).as_ref(),
                 LaunchConfig::for_num_elems(N as u32),
                 factor,
                 &input_dev,
                 &mut out_dev,
             )
-            .expect("Kernel launch failed");
+        }
+        .expect("Kernel launch failed");
 
         let out: Vec<u32> = out_dev.to_host_vec(&stream).unwrap();
         let expected: Vec<u32> = input.iter().map(|&x| x * factor).collect();
@@ -294,8 +407,9 @@ fn main() {
         let input_dev = DeviceBuffer::from_host(&stream, &input).unwrap();
         let mut out_dev = DeviceBuffer::<i32>::zeroed(&stream, N).unwrap();
 
-        module
-            .transform_kernel(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.transform_kernel(
                 (stream).as_ref(),
                 LaunchConfig::for_num_elems(N as u32),
                 offset,
@@ -303,7 +417,8 @@ fn main() {
                 &input_dev,
                 &mut out_dev,
             )
-            .expect("Kernel launch failed");
+        }
+        .expect("Kernel launch failed");
 
         let out: Vec<i32> = out_dev.to_host_vec(&stream).unwrap();
         let expected: Vec<i32> = input.iter().map(|&x| (x + offset) * scale).collect();
@@ -329,15 +444,17 @@ fn main() {
         let input_dev = DeviceBuffer::from_host(&stream, &input).unwrap();
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
 
-        module
-            .inline_with_param(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.inline_with_param(
                 (stream).as_ref(),
                 LaunchConfig::for_num_elems(N as u32),
                 factor,
                 &input_dev,
                 &mut out_dev,
             )
-            .expect("Kernel launch failed");
+        }
+        .expect("Kernel launch failed");
 
         let out: Vec<u32> = out_dev.to_host_vec(&stream).unwrap();
         let expected: Vec<u32> = input.iter().map(|&x| x * factor).collect();
@@ -357,13 +474,15 @@ fn main() {
         const N: usize = 8;
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
 
-        module
-            .test_closure_constant(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.test_closure_constant(
                 (stream).as_ref(),
                 LaunchConfig::for_num_elems(N as u32),
                 &mut out_dev,
             )
-            .expect("Kernel launch failed");
+        }
+        .expect("Kernel launch failed");
 
         let out: Vec<u32> = out_dev.to_host_vec(&stream).unwrap();
         let expected: Vec<u32> = vec![42; N];
@@ -382,13 +501,15 @@ fn main() {
         const N: usize = 8;
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
 
-        module
-            .test_closure_multi_arg(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.test_closure_multi_arg(
                 (stream).as_ref(),
                 LaunchConfig::for_num_elems(N as u32),
                 &mut out_dev,
             )
-            .expect("Kernel launch failed");
+        }
+        .expect("Kernel launch failed");
 
         let out: Vec<u32> = out_dev.to_host_vec(&stream).unwrap();
         let expected: Vec<u32> = (0..N).map(|i| i as u32 + 10).collect();
@@ -407,13 +528,15 @@ fn main() {
         const N: usize = 8;
         let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
 
-        module
-            .test_closure_fnonce(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.test_closure_fnonce(
                 (stream).as_ref(),
                 LaunchConfig::for_num_elems(N as u32),
                 &mut out_dev,
             )
-            .expect("Kernel launch failed");
+        }
+        .expect("Kernel launch failed");
 
         let out: Vec<u32> = out_dev.to_host_vec(&stream).unwrap();
         let expected: Vec<u32> = (0..N).map(|i| (i * 3) as u32).collect();
@@ -438,17 +561,166 @@ fn main() {
 
         println!("  factor = {}", factor);
 
-        module
-            .test_closure_capture_fnonce(
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.test_closure_capture_fnonce(
                 (stream).as_ref(),
                 LaunchConfig::for_num_elems(N as u32),
                 factor,
                 &mut out_dev,
             )
-            .expect("Kernel launch failed");
+        }
+        .expect("Kernel launch failed");
 
         let out: Vec<u32> = out_dev.to_host_vec(&stream).unwrap();
         let expected: Vec<u32> = (0..N).map(|i| (i * factor as usize) as u32).collect();
+
+        println!("  Output:   {:?}", out);
+        println!("  Expected: {:?}", expected);
+        assert_eq!(out, expected);
+        println!("  ✓ PASSED\n");
+    }
+
+    // =========================================================================
+    // Test 9: FnMut closure consumed through a FnOnce adapter
+    // =========================================================================
+    println!("Test 9: FnMut closure through FnOnce adapter");
+    {
+        const N: usize = 8;
+        let seed: u32 = 11;
+        let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.test_closure_fnmut_adapter(
+                (stream).as_ref(),
+                LaunchConfig::for_num_elems(N as u32),
+                seed,
+                &mut out_dev,
+            )
+        }
+        .expect("Kernel launch failed");
+
+        let out: Vec<u32> = out_dev.to_host_vec(&stream).unwrap();
+        let expected: Vec<u32> = (0..N).map(|i| seed + i as u32 + 3).collect();
+
+        println!("  Output:   {:?}", out);
+        println!("  Expected: {:?}", expected);
+        assert_eq!(out, expected);
+        println!("  ✓ PASSED\n");
+    }
+
+    // =========================================================================
+    // Test 10: genuine by-value FnOnce receiver
+    // =========================================================================
+    println!("Test 10: genuine by-value FnOnce receiver");
+    {
+        const N: usize = 8;
+        let seed: u32 = 13;
+        let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.test_genuine_fnonce_receiver(
+                (stream).as_ref(),
+                LaunchConfig::for_num_elems(N as u32),
+                seed,
+                &mut out_dev,
+            )
+        }
+        .expect("Kernel launch failed");
+
+        let out: Vec<u32> = out_dev.to_host_vec(&stream).unwrap();
+        let expected: Vec<u32> = (0..N).map(|i| seed + i as u32 + 5).collect();
+
+        println!("  Output:   {:?}", out);
+        println!("  Expected: {:?}", expected);
+        assert_eq!(out, expected);
+        println!("  ✓ PASSED\n");
+    }
+
+    // =========================================================================
+    // Test 11: Wrapper method named call with closure generic
+    // =========================================================================
+    println!("Test 11: Wrapper::call with closure generic");
+    {
+        const N: usize = 8;
+        let factor: u32 = 6;
+        let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+
+        println!("  factor = {}", factor);
+
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.test_wrapper_method_named_call(
+                (stream).as_ref(),
+                LaunchConfig::for_num_elems(N as u32),
+                factor,
+                &mut out_dev,
+            )
+        }
+        .expect("Kernel launch failed");
+
+        let out: Vec<u32> = out_dev.to_host_vec(&stream).unwrap();
+        let expected: Vec<u32> = (0..N).map(|i| (i as u32) * factor + 1).collect();
+
+        println!("  Output:   {:?}", out);
+        println!("  Expected: {:?}", expected);
+        assert_eq!(out, expected);
+        println!("  ✓ PASSED\n");
+    }
+
+    // =========================================================================
+    // Test 12: genuine closure called through a struct field projection
+    // =========================================================================
+    println!("Test 12: closure via field projection");
+    {
+        const N: usize = 8;
+        let factor: u32 = 5;
+        let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.test_closure_field_projection(
+                (stream).as_ref(),
+                LaunchConfig::for_num_elems(N as u32),
+                factor,
+                &mut out_dev,
+            )
+        }
+        .expect("Kernel launch failed");
+
+        let out: Vec<u32> = out_dev.to_host_vec(&stream).unwrap();
+        let expected: Vec<u32> = (0..N).map(|i| (i as u32) * factor).collect();
+
+        println!("  Output:   {:?}", out);
+        println!("  Expected: {:?}", expected);
+        assert_eq!(out, expected);
+        println!("  ✓ PASSED\n");
+    }
+
+    // =========================================================================
+    // Test 13: genuine closure called through a double reference
+    // =========================================================================
+    println!("Test 13: closure via double reference");
+    {
+        const N: usize = 8;
+        let factor: u32 = 7;
+        let mut out_dev = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.test_closure_double_ref(
+                (stream).as_ref(),
+                LaunchConfig::for_num_elems(N as u32),
+                factor,
+                &mut out_dev,
+            )
+        }
+        .expect("Kernel launch failed");
+
+        let out: Vec<u32> = out_dev.to_host_vec(&stream).unwrap();
+        let expected: Vec<u32> = (0..N).map(|i| (i as u32) * factor).collect();
 
         println!("  Output:   {:?}", out);
         println!("  Expected: {:?}", expected);

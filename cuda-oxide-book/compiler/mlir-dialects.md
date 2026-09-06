@@ -1,9 +1,16 @@
 # Pliron Dialects
 
 cuda-oxide does not lower Rust to PTX in a single, heroic transformation. It
-uses three custom pliron dialects, each modeling a different level of
-abstraction. This chapter walks through all three -- their types, their
-operations, and how they fit together to form the compilation pipeline.
+works across three pliron dialects on the way down, each modeling a different
+level of abstraction: two defined locally (`dialect-mir`, `dialect-nvvm`) and
+the LLVM dialect provided by the upstream `pliron-llvm` crate. This chapter
+walks through all three -- their types, their operations, and how they fit
+together to form the compilation pipeline.
+
+Two further pliron dialects live in this tree off that path and are not covered
+here: `dialect-iket`, the compiler-facing form of in-kernel event tracing, and
+`dialect-ptx`, a structured terminal PTX dialect that can be built directly or
+projected from parsed PTX source. Each crate's README is the reference.
 
 If you have not read the [Pliron -- Pliron IR (MLIR-like)](pliron.md) chapter yet, now
 is a good time. The concepts there (operations, types, attributes, regions,
@@ -16,21 +23,26 @@ is a good time. The concepts there (operations, types, attributes, regions,
 | Dialect          | Purpose                      | Level                                                            |
 | :--------------- | :--------------------------- | :--------------------------------------------------------------- |
 | **dialect-mir**  | Models Rust MIR semantics    | Highest -- Rust types, tuples, enums, slices, checked arithmetic |
-| **dialect-llvm** | Models LLVM IR               | Middle -- flat types, GEP, PHI-ready control flow                |
+| **LLVM dialect** | Models LLVM IR               | Middle -- flat types, GEP, PHI-ready control flow                |
 | **dialect-nvvm** | Models NVIDIA GPU intrinsics | Orthogonal -- thread indexing, warps, TMA, WGMMA, tcgen05        |
 
+The LLVM dialect is not a cuda-oxide crate: its modeling (ops, types,
+attributes, op-interfaces) lives upstream in the `pliron-llvm` crate, which
+cuda-oxide consumes as a dependency.
+
 `dialect-nvvm` is "orthogonal" rather than a layer in the stack because its
-operations appear *alongside* `dialect-llvm` operations, not below them. A
+operations appear *alongside* LLVM dialect operations, not below them. A
 warp shuffle and an integer add coexist in the same function body.
 
 Data flows through the pipeline like this:
 
 ```text
-dialect-mir ──(mem2reg)──▶ dialect-mir (SSA) ──(DialectConversion)──▶ dialect-llvm + dialect-nvvm ops ──(export.rs)──▶ textual LLVM IR ──(llc)──▶ PTX
+dialect-mir ──(mem2reg)──▶ dialect-mir (SSA) ──(annotated unroll)──▶ dialect-mir
+  ──(DialectConversion)──▶ LLVM dialect + dialect-nvvm ops ──(export)──▶ LLVM IR ──(llc)──▶ PTX
 ```
 
-Each arrow is a well-defined transformation. The first two happen inside
-pliron; the last one is LLVM's NVPTX backend doing what it does best.
+Each arrow is a well-defined transformation over pliron or LLVM IR. The last
+one is LLVM's NVPTX backend doing what it does best.
 
 ---
 
@@ -43,7 +55,7 @@ to LLVM's type system.
 
 ### Types
 
-The dialect defines seven custom types that mirror Rust's compound types:
+The dialect defines nine custom types that mirror Rust's own:
 
 | Type                 | Example                                                   | Description                                                   |
 | :------------------- | :-------------------------------------------------------- | :------------------------------------------------------------ |
@@ -51,9 +63,11 @@ The dialect defines seven custom types that mirror Rust's compound types:
 | `mir.ptr`            | `mir.ptr<f32, mutable, addrspace: 1>`                     | Pointers with GPU address space                               |
 | `mir.array`          | `mir.array<f32, 256>`                                     | Fixed-size arrays                                             |
 | `mir.struct`         | `mir.struct<"Point", [f32, f32]>`                         | Named structs with layout info                                |
+| `mir.union`          | `mir.union<"Repr", [a, b], [i32, f32], 4, 4>`             | Rust unions -- every field is a view of the same bytes        |
 | `mir.slice`          | `mir.slice<f32, addrspace: 1>`                            | Fat pointers (ptr + length)                                   |
-| `mir.disjoint_slice` | `mir.disjoint_slice<f32>`                                 | Safety-checked slice -- each thread accesses a unique element |
+| `mir.disjoint_slice` | `mir.disjoint_slice<f32>`                                 | Bounds-checked slice carrying a typed index space              |
 | `mir.enum`           | `mir.enum<"Option_i32", [("None", []), ("Some", [i32])]>` | Rust enums with discriminant and variant payloads             |
+| `mir.fp16`           | `mir.fp16`                                                | IEEE 754 binary16, Rust's `f16`                               |
 
 The address spaces on `mir.ptr` and `mir.slice` track where data lives in
 the GPU memory hierarchy:
@@ -69,21 +83,23 @@ the GPU memory hierarchy:
 
 ### Operations
 
-`dialect-mir` defines 54 operations across 11 categories:
+`dialect-mir` defines 62 operations across 12 categories, one per module under
+`crates/dialect-mir/src/ops/`:
 
 | Category     | Examples                                                                                                                                                                                            | Count |
 | :----------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----: |
 | Function     | `mir.func`                                                                                                                                                                                          |     1 |
-| Control flow | `mir.goto`, `mir.cond_br`, `mir.return`, `mir.assert`, `mir.unreachable`                                                                                                                            |     5 |
+| Control flow | `mir.goto`, `mir.cond_br`, `mir.return`, `mir.assert`, `mir.unreachable`, `mir.unroll_hint`                                                                                                         |     6 |
 | Constants    | `mir.constant`, `mir.float_constant`, `mir.undef`                                                                                                                                                   |     3 |
-| Memory       | `mir.alloca`, `mir.load`, `mir.store`, `mir.assign`, `mir.ref`, `mir.ptr_offset`, `mir.shared_alloc`, `mir.global_alloc`, `mir.extern_shared`                                                       |     9 |
+| Memory       | `mir.alloca`, `mir.load`, `mir.store`, `mir.assign`, `mir.ref`, `mir.ptr_offset`, `mir.memcpy`, `mir.memmove`, `mir.shared_alloc`, `mir.global_alloc`, `mir.extern_shared`                          |    11 |
 | Arithmetic   | `mir.add`, `mir.sub`, `mir.mul`, `mir.div`, `mir.rem`, `mir.checked_add`, `mir.checked_sub`, `mir.checked_mul`, `mir.neg`, `mir.not`, `mir.shr`, `mir.shl`, `mir.bitand`, `mir.bitor`, `mir.bitxor` |    15 |
-| Comparison   | `mir.eq`, `mir.ne`, `mir.lt`, `mir.le`, `mir.gt`, `mir.ge`                                                                                                                                          |     6 |
-| Aggregate    | `mir.extract_field`, `mir.insert_field`, `mir.construct_struct`, `mir.construct_tuple`, `mir.construct_array`, `mir.extract_array_element`, `mir.field_addr`, `mir.array_element_addr`              |     8 |
-| Enum         | `mir.get_discriminant`, `mir.construct_enum`, `mir.enum_payload`                                                                                                                                    |     3 |
+| Comparison   | `mir.eq`, `mir.ne`, `mir.lt`, `mir.le`, `mir.gt`, `mir.ge`, `mir.cmp`                                                                                                                               |     7 |
+| Aggregate    | `mir.extract_field`, `mir.insert_field`, `mir.construct_struct`, `mir.construct_tuple`, `mir.construct_array`, `mir.construct_slice`, `mir.construct_disjoint_slice`, `mir.extract_array_element`, `mir.field_addr`, `mir.array_element_addr` |    10 |
+| Enum         | `mir.get_discriminant`, `mir.set_discriminant`, `mir.construct_enum`, `mir.enum_payload`                                                                                                            |     4 |
 | Cast         | `mir.cast`                                                                                                                                                                                          |     1 |
 | Storage      | `mir.storage_live`, `mir.storage_dead`                                                                                                                                                              |     2 |
 | Call         | `mir.call`                                                                                                                                                                                          |     1 |
+| Debug        | `mir.dbg_value`                                                                                                                                                                                     |     1 |
 
 That is a lot of operations, but they fall into natural groups. If you know
 Rust MIR (or have read the [rustc_public chapter](rustc-public.md)), each
@@ -133,19 +149,23 @@ Examples of what gets checked:
 - `mir.store` verifies that the value type matches the pointee type of the
   pointer.
 
-The `DisjointSlice` safety guarantee ("one thread, one element") is enforced
-at the type-system level via `ThreadIndex` -- only hardware-derived thread
-indices can access the slice. There is no separate compiler pass for
-disjoint-access verification; the safety comes from the Rust type system
-and `cuda-device`'s API design.
+`DisjointSlice` accepts only a matching `ThreadIndex`, so the type system checks
+the device-side index space. Host launch geometry completes the uniqueness
+proof through `PreparedLaunch<K>` or an unsafe raw-launch obligation. There is
+no separate disjoint-access compiler pass; the safety comes from these APIs.
 
 ---
 
-## dialect-llvm -- The LLVM Layer
+## The LLVM Dialect -- The LLVM Layer
 
-`dialect-llvm` models LLVM IR as pliron operations. It provides a near-1:1
+The LLVM dialect models LLVM IR as pliron operations. It provides a near-1:1
 mapping to textual `.ll` files -- every LLVM instruction has a corresponding
-pliron operation, and the types map directly to LLVM's type system.
+pliron operation, and the types map directly to LLVM's type system. The
+dialect itself (ops, types, attributes, op-interfaces) is defined upstream in
+the `pliron-llvm` crate; cuda-oxide consumes it and re-exports it through the
+thin `llvm-export` crate, which also carries the textual `.ll` exporter and a
+few GPU-specific extensions (named address spaces, fp16 bit helpers) that
+pliron-llvm does not ship.
 
 ### Types
 
@@ -160,30 +180,38 @@ pliron operation, and the types map directly to LLVM's type system.
 | `llvm.func`   | `(i32, ptr) -> void`                    | Function signatures                                  |
 | `llvm.void`   | `void`                                  | The unit type                                        |
 
-Note the absence of Rust-specific types. By the time code reaches
-`dialect-llvm`, tuples have become structs, enums have become
+Note the absence of Rust-specific types. By the time code reaches the
+LLVM dialect, tuples have become structs, enums have become
 discriminant-indexed structs, and slices have become pointer-length pairs.
 The lowering pass (covered in [The Lowering Pipeline](lowering-pipeline.md))
 handles all of that flattening.
 
 ### Operations
 
-The dialect defines 62 operations:
+At the pinned `pliron` revision the dialect defines 69 operations:
 
 | Category     | Examples                                                                                                                                | Count |
 | :----------- | :-------------------------------------------------------------------------------------------------------------------------------------- | ----: |
 | Arithmetic   | `add`, `sub`, `mul`, `fadd`, `fsub`, `fmul`, `fdiv`, `frem`, `fneg`, ...                                                                |    19 |
 | Cast         | `zext`, `sext`, `trunc`, `fpext`, `fptrunc`, `sitofp`, `uitofp`, `fptosi`, `fptoui`, `ptrtoint`, `inttoptr`, `addrspacecast`, `bitcast` |    13 |
-| Control flow | `br`, `cond_br`, `switch`, `return`, `unreachable`                                                                                      |     5 |
+| Control flow | `br`, `cond_br`, `switch`, `return`, `unreachable`, `indirectbr`                                                                        |     6 |
 | Memory       | `load`, `store`, `alloca`, `gep`                                                                                                        |     4 |
 | Atomic       | `atomic_load`, `atomic_store`, `atomicrmw`, `cmpxchg`, `fence`                                                                          |     5 |
 | Comparison   | `icmp`, `fcmp`                                                                                                                          |     2 |
-| Aggregate    | `extract_value`, `insert_value`, `extractelement`                                                                                       |     3 |
+| Aggregate    | `extract_value`, `insert_value`, `extract_element`, `insert_element`, `shuffle_vector`                                                  |     5 |
 | Call         | `call`, `call_intrinsic`                                                                                                                |     2 |
-| Inline asm   | `inline_asm`, `inline_asm_multi`                                                                                                        |     2 |
-| Constants    | `constant`, `zero`, `undef`                                                                                                             |     3 |
+| Inline asm   | `inline_asm`                                                                                                                            |     1 |
+| Constants    | `constant`, `zero`, `undef`, `poison`                                                                                                   |     4 |
 | Symbol       | `func`, `global`, `addressof`                                                                                                           |     3 |
 | Select       | `select`                                                                                                                                |     1 |
+| Other        | `freeze`, `va_arg`, `blockaddress`, `blocktag`                                                                                          |     4 |
+
+`llvm-export` adds one operation of its own on top of those, `llvm.dbg_value`,
+alongside the address-space and fp16 helpers mentioned above.
+
+Because the dialect is upstream, this table moves when the `pliron` pin moves
+rather than when this repository changes; `pliron-llvm`'s `src/ops.rs` is the
+list it is counting.
 
 If you have read LLVM IR before, nothing here will surprise you. The operation
 names are intentionally the same as their LLVM counterparts, prefixed with
@@ -191,9 +219,12 @@ names are intentionally the same as their LLVM counterparts, prefixed with
 
 ### The Export Engine
 
-The crown jewel of dialect-llvm is `export.rs` -- the module that converts a
-pliron IR module into valid textual LLVM IR. This is not just "print each
-operation"; several non-trivial transformations happen during export:
+The crown jewel of `llvm-export` is its export module
+(`crates/llvm-export/src/export/`) -- the code that converts a pliron IR
+module into valid textual LLVM IR. This is the part cuda-oxide keeps local:
+pliron-llvm only emits real `.ll` via an `llvm-sys` bridge, which cuda-oxide
+avoids. This is not just "print each operation"; several non-trivial
+transformations happen during export:
 
 **Block arguments become PHI nodes.** Pliron IR (MLIR-like) models merge points
 as block arguments -- a function-style calling convention between basic blocks.
@@ -251,7 +282,7 @@ attributes #0 = { convergent }
 
 Notice the slices have been scalarized: each Rust `&[f32]` becomes a
 `ptr addrspace(1)` and an `i64` length. That happened in the lowering pass;
-by the time `dialect-llvm` sees them, they are flat arguments.
+by the time the LLVM dialect sees them, they are flat arguments.
 
 ---
 
@@ -259,34 +290,66 @@ by the time `dialect-llvm` sees them, they are flat arguments.
 
 `dialect-nvvm` wraps NVIDIA's GPU intrinsics as typed pliron operations.
 These operations do not form a "level" in the lowering chain -- they are
-inserted during the `dialect-mir` → `dialect-llvm` lowering pass and coexist
-with `dialect-llvm` operations in the same function body. At export time,
+inserted during the `dialect-mir` → LLVM dialect lowering pass and coexist
+with LLVM dialect operations in the same function body. At export time,
 they become `call` instructions to `@llvm.nvvm.*` intrinsics.
 
 ### Architecture Coverage
 
-The dialect is organized into modules, each targeting a GPU feature set:
+At catalog SHA-256 `3df52944` (the stamp in every `ops/generated/` file
+header), the dialect holds 576 operations across 42 modules, and they come
+from two different places. The split is the first thing to know about it,
+because it decides where -- and whether -- you would add one. If the header
+stamp no longer starts with `3df52944`, the counts on this page predate the
+catalog you are reading.
 
-| Module     | Description                                          | Ops | Minimum SM | GPU Family |
-| :--------- | :--------------------------------------------------- | --: | :--------- | :--------- |
-| `thread`   | Thread/block indexing, `barrier0`, threadfences      |  18 | All        | All GPUs   |
-| `warp`     | Lane id, shuffle, vote, match                        |  18 | All        | All GPUs   |
-| `grid`     | Cooperative `grid_sync`                              |   1 | sm_70      | Volta+     |
-| `debug`    | Clock, trap, breakpoint, `vprintf`                   |   6 | All        | All GPUs   |
-| `atomic`   | Atomic load/store/RMW/cmpxchg                        |   4 | sm_70      | Volta+     |
-| `cluster`  | Thread Block Clusters + DSMEM                        |  11 | sm_90      | Hopper+    |
-| `mbarrier` | Async barriers + fence proxy + nanosleep             |  10 | sm_90      | Hopper+    |
-| `tma`      | Tensor Memory Accelerator (bulk G2S/S2G)             |  15 | sm_90      | Hopper+    |
-| `wgmma`    | Warpgroup Matrix Multiply-Accumulate                 |   5 | sm_90      | Hopper+    |
-| `stmatrix` | Shared memory matrix store + bf16 convert            |   5 | sm_90      | Hopper+    |
-| `tcgen05`  | Tensor Core Gen 5 + TMEM                             |  24 | sm_100     | Blackwell+ |
-| `clc`      | Cluster Launch Control                               |   6 | sm_100     | Blackwell+ |
+**Hand-written**, directly under `crates/dialect-nvvm/src/ops/`. These are the
+ops with bespoke verification or lowering that the intrinsic catalog does not
+describe. There are seven modules and 26 operations:
 
-That is 123 operations total. Most users will only encounter the first three
-modules (thread indexing, warp shuffles, barriers). The rest are for advanced
-GPU programming -- TMA, matrix accelerators, and Blackwell's tensor memory --
-covered in the [Advanced GPU Features](../advanced/tensor-memory-accelerator.md)
-chapters.
+| Module    | Description                                                 | Ops |
+| :-------- | :---------------------------------------------------------- | --: |
+| `asm`     | `inline_ptx`                                                |   1 |
+| `atomic`  | Atomic load/store/RMW/cmpxchg/fence                         |   5 |
+| `cluster` | Cluster index and cluster-count registers                   |   2 |
+| `debug`   | `assertfail`, `vprintf`                                     |   2 |
+| `grid`    | Cooperative `grid_sync`                                     |   1 |
+| `memory`  | Generic-to-shared address conversion with a byte offset     |   1 |
+| `wgmma`   | Warpgroup MMA descriptors; bf16/f16 at m64n64k16, bf16 at m64n128k16, tf32 at m64n64k8 |  14 |
+
+**Generated**, under `ops/generated/`, from `intrinsics/catalog.json` by
+`cuda-intrinsics-gen`. Every file there opens with `// @generated ... DO NOT
+EDIT.`, and editing one by hand is undone by the next generator run. This is
+the large majority -- 35 modules and 550 operations, resolved from 1025 catalog
+entries, since several intrinsics can share one structural op:
+
+| Area                        | Modules                                                                       | Ops |
+| :-------------------------- | :---------------------------------------------------------------------------- | --: |
+| Tensor Core Gen 5 + TMEM    | `tcgen05`                                                                     | 210 |
+| Tensor Memory Accelerator   | `tma`                                                                         | 111 |
+| Special registers           | `sreg`                                                                        |  44 |
+| Packed (SIMD-in-register)   | `packed_alu`, `packed_conversion`, `packed_atomic`                            |  51 |
+| Async copy and barriers     | `cp_async`, `mbarrier_extended`, `mbarrier_basic`, `sync`                     |  35 |
+| Warp-level                  | `warp_shuffle`, `redux`, `vote`, `warp_match`, `warp_barrier`, `active_mask`, `elect` |  39 |
+| Matrix fragment movement    | `ldmatrix`, `register_mma`, `stmatrix`, `wgmma_control`, `movmatrix`, `sparse_mma` |  22 |
+| Execution and debug control | `execution_control`, `debug_control`                                          |  11 |
+| Cluster                     | `clc`, `cluster_barrier`, `cluster_memory`                                    |  10 |
+| Scalar math                 | `dotprod`, `scalar_arithmetic`, `scalar_conversion`, `scalar_math`, `extended_minmax`, `prmt` |   9 |
+| Integer min/max (DPX)       | `integer_minmax`                                                              |   8 |
+
+Architecture requirements live per intrinsic rather than per module -- the
+catalog records the PTX version and minimum SM for each, and
+`intrinsics/generated-reference.md` renders them alongside the PTX each one is
+expected to emit. That file is regenerated with the ops, so it is the list to
+consult rather than a count kept by hand here.
+
+Most users will only encounter special registers, warp shuffles and barriers.
+The rest are for advanced GPU programming -- TMA, matrix accelerators, and
+Blackwell's tensor memory -- covered in the
+[Advanced GPU Features](../advanced/tensor-memory-accelerator.md) chapters. If
+you are adding an op, read
+[Adding New Intrinsics](adding-new-intrinsics.md) first: it walks the catalog
+path, which is the one nearly every new intrinsic takes.
 
 ### From Rust to PTX: An Intrinsic's Journey
 
@@ -300,10 +363,12 @@ Each NVVM operation maps through three levels of naming:
 | `CpAsyncBulkTensorG2sTile2dOp` | `llvm.nvvm.cp.async.bulk.tensor.2d.tile.g2s.im2col.*` | `cp.async.bulk.tensor.2d.tile.g2s ...` |
 
 The first column is the Rust struct name in `dialect-nvvm`. The second is what
-`export.rs` emits (after the underscore-to-dot transformation). The third is
-what `llc` produces. You never have to write any of these by hand -- they are
-generated by `mir-lower` when it sees calls to `cuda-device` intrinsic
-functions like `thread::index_x()` or `warp::shfl_sync_bfly()`.
+`llvm-export` emits (after the underscore-to-dot transformation). The third is
+what `llc` produces. You never have to write any of these by hand:
+`mir-importer` emits the operation when it translates a call to a
+`cuda-device` intrinsic such as `thread::threadIdx_x()` or
+`warp::shuffle_xor_sync()`, and the later stages derive the other two forms
+from it.
 
 ### Verification Strategy
 
@@ -312,7 +377,7 @@ its operand count and result count, and a handful verify result types (thread
 indexing ops require `i32` results; `tcgen05` loads check exact result counts
 for their 32-register and 4-register variants).
 
-This is intentional. NVVM operations are machine-generated by `mir-lower` --
+This is intentional. NVVM operations are machine-generated by `mir-importer` --
 they are never hand-written by users. LLVM's NVPTX backend provides
 comprehensive type validation downstream. Adding full type checking to every
 NVVM operation would double the dialect's code size for zero practical benefit.
@@ -336,14 +401,14 @@ Rust source:   let sum = a + b;        // a, b: f32
 
 dialect-mir:   %sum = mir.add %a, %b : f32
                 ↓  (DialectConversion)
-dialect-llvm:  %v5 = fadd float %v3, %v4
-                ↓  (export.rs)
+LLVM dialect:  %v5 = fadd float %v3, %v4
+                ↓  (llvm-export)
 LLVM IR:       %v5 = fadd float %v3, %v4
                 ↓  (llc --mcpu=sm_80)
 PTX:           add.f32 %f3, %f1, %f2;
 ```
 
-The `dialect-mir` → `dialect-llvm` step is where the interesting work
+The `dialect-mir` → LLVM dialect step is where the interesting work
 happens: `mir.add` on `f32` becomes `fadd` (floating-point add), while
 `mir.add` on `i32` becomes `add` (integer add). Checked operations like
 `mir.checked_add` expand into an `llvm.add`, a constant `i1 false` for the
@@ -355,25 +420,25 @@ For GPU-specific operations, `dialect-nvvm` enters the picture:
 
 ```text
 Rust source:   let tid = thread::threadIdx_x();
-
-dialect-mir:   %tid = mir.call @cuda_oxide_device_<hash>_thread_index_x()
-                ↓  (DialectConversion, recognizes the intrinsic)
+                ↓  (mir-importer matches "cuda_device::thread::threadIdx_x")
 dialect-nvvm:  %v2 = nvvm.read_ptx_sreg_tid_x : i32
-                ↓  (export.rs)
+                ↓  (mir-lower, then llvm-export)
 LLVM IR:       %v2 = call i32 @llvm.nvvm.read.ptx.sreg.tid.x() #0
                 ↓  (llc)
 PTX:           mov.u32 %r1, %tid.x;
 ```
 
-The lowering pass recognizes calls to `cuda_device` intrinsic functions by
-their fully qualified names (FQDNs) and replaces them with the corresponding
-`dialect-nvvm` operations. No generic "function call" machinery is needed --
-the intrinsic becomes a direct hardware instruction.
+The translator in `mir-importer` recognizes calls to `cuda_device` intrinsic
+functions by their fully qualified names (FQDNs); the arm that matches
+`threadIdx_x` is generated from `intrinsics/catalog.json` into its dispatch.
+The call never becomes a `mir.call`: the translator emits the `dialect-nvvm`
+operation on the spot, and the intrinsic ends up a direct hardware
+instruction.
 
 ### The Full Picture
 
 Putting it all together, a compiled kernel body contains a mix of
-`dialect-llvm` and `dialect-nvvm` operations:
+LLVM dialect and `dialect-nvvm` operations:
 
 ```text
 llvm.func @vecadd(...) {
@@ -400,7 +465,7 @@ llvm.func @vecadd(...) {
 ```
 
 The `dialect-nvvm` operations at the top compute the global thread index.
-Everything else is standard `dialect-llvm` -- loads, stores, arithmetic,
+Everything else is standard LLVM dialect -- loads, stores, arithmetic,
 branches. The export engine serializes all of it into a single `.ll` file,
 and `llc` compiles it to PTX.
 

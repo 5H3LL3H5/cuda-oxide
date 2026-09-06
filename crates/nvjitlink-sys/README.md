@@ -18,14 +18,14 @@ None. The library is loaded at runtime, so the CUDA Toolkit only needs to be pre
 `LibNvJitLink::load()` tries (in order):
 
 1. `LIBNVJITLINK_PATH` env var, if set.
-2. The system loader (`libnvJitLink.so.13`, `libnvJitLink.so.12`, `libnvJitLink.so`).
-3. `<root>/lib64/libnvJitLink.so` for `<root>` in `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda`.
+2. `<root>/lib64/libnvJitLink.so` for `<root>` in `CUDA_TOOLKIT_PATH`, `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda`.
+3. The system loader (`libnvJitLink.so.13`, `libnvJitLink.so.12`, `libnvJitLink.so`).
 
 nvJitLink ships with the standard CUDA Toolkit at `<cuda>/lib64/`. No separate download.
 
 ## Symbol naming
 
-`nvJitLink.h` `#define`s every public function to a versioned mangled name (e.g. `nvJitLinkCreate -> __nvJitLinkCreate_13_0`), but the library also exports the unversioned name with default ELF symbol versioning. `dlsym(handle, "nvJitLinkCreate")` resolves to the right function on every CUDA Toolkit version, so this binding does not need to probe per-CUDA-version symbol suffixes.
+`nvJitLink.h` maps every public function to a versioned mangled name (e.g. `nvJitLinkCreate -> __nvJitLinkCreate_13_0`). Toolkit installations may export either the public unsuffixed name or only the mangled name, so the binding probes both forms.
 
 ## Usage
 

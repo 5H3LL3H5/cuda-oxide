@@ -8,7 +8,7 @@
 //! A `#[kernel]` calls an `#[inline(never)]` device-reachable function
 //! that returns `(f32, f32)` by value, and uses the destructured result.
 //! With inlining suppressed, the tuple-returning `mir.call` survives into
-//! the `dialect-mir -> dialect-llvm` lowering. The buggy `is_unit` check
+//! the `dialect-mir` -> LLVM dialect lowering. The buggy `is_unit` check
 //! at `crates/mir-lower/src/convert/ops/call.rs` matches every
 //! `MirTupleType` (not just the empty unit tuple), forces the LLVM call
 //! result to `void`, then falls through to `erase_operation` on a MIR op
@@ -20,7 +20,8 @@
 //! Build and run with:
 //!   cargo oxide run tuple_return
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::simt::LaunchConfig;
+use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_device::{DisjointSlice, kernel};
 use cuda_host::cuda_module;
 
@@ -52,18 +53,16 @@ fn main() {
     let stream = ctx.default_stream();
     let mut dev = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
 
-    let module = ctx
-        .load_module_from_file("tuple_return.ptx")
-        .expect("Failed to load PTX module");
-    let module = kernels::from_module(module).expect("Failed to initialize typed module");
-
-    module
-        .run(
+    let module = kernels::load(&ctx).expect("Failed to load embedded CUDA module");
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.run(
             (stream).as_ref(),
             LaunchConfig::for_num_elems(N as u32),
             &mut dev,
         )
-        .expect("Kernel launch failed");
+    }
+    .expect("Kernel launch failed");
 
     let host = dev.to_host_vec(&stream).unwrap();
     println!("output = {:?}", host);

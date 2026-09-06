@@ -9,9 +9,9 @@ use std::hash::{Hash, Hasher};
 
 use pliron::attribute::Attribute;
 use pliron::builtin::attr_interfaces::{FloatAttr, TypedAttrInterface};
-use pliron::context::{Context, Ptr};
+use pliron::context::Context;
 use pliron::derive::{attr_interface_impl, pliron_attr};
-use pliron::r#type::{TypeObj, Typed};
+use pliron::r#type::{TypeHandle, Typed};
 use pliron::utils::apfloat::{self, Float, GetSemantics};
 
 use crate::types::MirFP16Type;
@@ -41,6 +41,33 @@ pub enum MirCastKindAttr {
     Subtype,
 }
 
+/// The Rust semantic boundary that authorizes a pointer-kind transition.
+///
+/// Ordinary MIR operations may preserve a pointer kind or deliberately erase
+/// it, but they may not recover or change a concrete Rust pointer category.
+/// A `mir.cast` that does establish a new concrete category must carry one of
+/// these authorities so the provenance-changing boundary remains explicit and
+/// auditable in the dialect.
+#[pliron_attr(name = "mir.pointer_kind_authority", format, verifier = "succ")]
+#[derive(PartialEq, Eq, Clone, Debug, Hash)]
+pub enum MirPointerKindAuthorityAttr {
+    /// A rustc `Rvalue::Ref` (`&place` / `&mut place`).
+    Reborrow,
+    /// A rustc `Rvalue::AddressOf` (`&raw const` / `&raw mut`).
+    RawAddress,
+    /// A pointer-producing cast or coercion explicitly present in rustc MIR.
+    RustCast,
+    /// Materialization of a pointer-valued Rust constant, static, or promoted
+    /// allocation at the exact type declared by rustc.
+    StaticAddress,
+    /// Adaptation to an exact Rust function or intrinsic ABI type.
+    AbiBoundary,
+    /// A user-authored inline-assembly output assigned the exact destination
+    /// type supplied by rustc MIR. This records the unsafe source boundary;
+    /// it does not independently prove that the assembly produced valid bits.
+    InlineAsm,
+}
+
 /// Boolean attribute for reference mutability.
 ///
 /// Replaces the overloaded `IntegerAttr` pattern with a self-documenting
@@ -61,34 +88,36 @@ pub struct FieldIndexAttr(pub u32);
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
 pub struct VariantIndexAttr(pub u32);
 
-/// Niche encoding for a `Cast(Transmute)` whose destination is a
-/// niche-optimised enum.
+/// The unroll factor carried by a [`MirUnrollHintOp`](crate::ops::MirUnrollHintOp).
 ///
-/// rustc stores `Option<NonZeroT>`, `Option<&T>`, `Option<Box<T>>`,
-/// `Option<NonNull<T>>`, `Option<bool>`, `Option<char>`, etc. as a single
-/// scalar where one forbidden bit pattern of the inner type stands in for
-/// the niche variant (typically `None`) and any other bit pattern means
-/// the active variant (typically `Some(x)`).
+/// `#[unroll]` / `#[unroll(N)]` written on a loop makes the frontend plant a
+/// `mir.unroll_hint` op inside that loop's body; this attribute is the factor it
+/// carries, and the loop-unroll pass reads it to decide how to unroll that one
+/// loop:
 ///
-/// When mir-lower has to rebuild the un-niched `{ discriminant, payload }`
-/// aggregate from such a scalar it needs:
-///
-/// * `niche_start` -- the bit pattern that signals the niche variant.
-/// * `niche_variant_idx` -- the discriminant value for the niche variant.
-/// * `untagged_variant_idx` -- the discriminant value for the active variant.
-///
-/// All three come from `ty.layout().shape().variants` when the tag
-/// encoding is `TagEncoding::Niche`. `niche_start` is stored as `u64`
-/// rather than the `u128` rustc-public exposes: niched scalars are at
-/// most 64 bits wide, so the bit pattern always fits. The importer
-/// rejects wider niches up front rather than truncating silently.
-#[pliron_attr(name = "mir.niche_encoding", format, verifier = "succ")]
+/// * `0` -- **full unroll**: if the loop's trip count is a compile-time
+///   constant, unroll it completely, so the induction variable becomes a literal
+///   in each copy (this is what lets index arithmetic such as `i & 3` fold to a
+///   constant).
+/// * `n >= 2` -- **unroll by `n`**: do `n` copies of the body per trip, leaving
+///   a remainder loop when `n` does not divide the trip count.
+#[pliron_attr(name = "mir.unroll", format = "$0", verifier = "succ")]
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
-pub struct NicheEncodingAttr {
-    pub niche_start: u64,
-    pub niche_variant_idx: u32,
-    pub untagged_variant_idx: u32,
-}
+pub struct UnrollAttr(pub u32);
+
+/// Marks an aggregate that exists only to adapt one compiler-owned
+/// multi-result operation to a Rust aggregate return ABI.
+///
+/// The marker is intentionally attached by the MIR importer, not inferred by
+/// an optimisation pass. That lets the forwarding pass distinguish this
+/// compiler-created boundary from an ordinary user aggregate and fail closed
+/// whenever the exact producer/store/projection shape is not preserved.
+#[pliron_attr(name = "mir.compiler_result_bundle", format = "$0", verifier = "succ")]
+#[derive(PartialEq, Eq, Clone, Debug, Hash)]
+pub struct CompilerResultBundleAttr(pub bool);
+
+/// Operation attribute key carrying [`CompilerResultBundleAttr`].
+pub const COMPILER_RESULT_BUNDLE_ATTR_KEY: &str = "compiler_result_bundle";
 
 /// IEEE 754 binary16 floating-point attribute for Rust MIR `f16` constants.
 #[pliron_attr(name = "mir.fp16_attr", format = "$0", verifier = "succ")]
@@ -112,14 +141,14 @@ impl Hash for MirFP16Attr {
 }
 
 impl Typed for MirFP16Attr {
-    fn get_type(&self, ctx: &Context) -> Ptr<TypeObj> {
+    fn get_type(&self, ctx: &Context) -> TypeHandle {
         MirFP16Type::get(ctx).into()
     }
 }
 
 #[attr_interface_impl]
 impl TypedAttrInterface for MirFP16Attr {
-    fn get_type(&self, ctx: &Context) -> Ptr<TypeObj> {
+    fn get_type(&self, ctx: &Context) -> TypeHandle {
         MirFP16Type::get(ctx).into()
     }
 }
@@ -151,9 +180,11 @@ impl FloatAttr for MirFP16Attr {
 
 pub fn register(ctx: &mut Context) {
     MirCastKindAttr::register(ctx);
+    MirPointerKindAuthorityAttr::register(ctx);
     MutabilityAttr::register(ctx);
     FieldIndexAttr::register(ctx);
     VariantIndexAttr::register(ctx);
-    NicheEncodingAttr::register(ctx);
+    UnrollAttr::register(ctx);
+    CompilerResultBundleAttr::register(ctx);
     MirFP16Attr::register(ctx);
 }

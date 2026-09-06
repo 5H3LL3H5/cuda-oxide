@@ -25,6 +25,18 @@ use cuda_host::cuda_module;
 mod kernels {
     use super::*;
 
+    /// Keeps the generated cluster-grid helper path in the compiled module.
+    #[kernel]
+    pub fn compile_cluster_grid_helpers(mut output: DisjointSlice<u32>) {
+        if thread::threadIdx_x() == 0 && output.len() >= 2 {
+            // SAFETY: the length check covers both output slots.
+            unsafe {
+                *output.get_unchecked_mut(0) = cluster::cluster_idx();
+                *output.get_unchecked_mut(1) = cluster::num_clusters();
+            }
+        }
+    }
+
     /// Test kernel with compile-time cluster configuration.
     ///
     /// The `#[cluster_launch(4, 1, 1)]` attribute tells the compiler to emit:
@@ -87,7 +99,14 @@ mod kernels {
     // ============================================================================
 
     /// Test kernel for cluster_sync().
+    ///
+    /// `cluster_sync` only has meaning when the kernel actually runs as a
+    /// thread-block cluster, so this must carry `#[cluster_launch(...)]` like
+    /// the DSMEM tests below. Without it the grid launches as ordinary blocks,
+    /// every block is its own size-1 cluster, `block_rank()` is always 0, and
+    /// only `output[0]` is written.
     #[kernel]
+    #[cluster_launch(4, 1, 1)]
     pub fn test_cluster_sync(mut output: DisjointSlice<u32>) {
         static mut SHMEM: SharedArray<u32, 1> = SharedArray::UNINIT;
 
@@ -117,7 +136,7 @@ mod kernels {
     // Test 3: Distributed Shared Memory (Ring Exchange)
     // ============================================================================
 
-    /// Test kernel for distributed shared memory via dsmem_read_u32().
+    /// Test kernel for distributed shared memory via map_shared_rank() + dereference.
     #[kernel]
     #[cluster_launch(4, 1, 1)]
     pub fn test_dsmem_ring_exchange(mut output: DisjointSlice<u32>) {
@@ -139,8 +158,9 @@ mod kernels {
         // Step 3: Read neighbor's shared memory (ring pattern)
         if tid == 0 {
             let neighbor_rank = (my_rank + 1) % cluster_size;
-            let neighbor_value =
-                unsafe { cluster::dsmem_read_u32(addr_of!(SHMEM) as *const u32, neighbor_rank) };
+            let neighbor_ptr =
+                unsafe { cluster::map_shared_rank(addr_of!(SHMEM) as *const u32, neighbor_rank) };
+            let neighbor_value = unsafe { *neighbor_ptr };
 
             let idx = my_rank as usize;
             if idx < output.len() {
@@ -191,6 +211,47 @@ mod kernels {
         // All blocks must stay alive while block 0 reads DSMEM
         cluster::cluster_sync();
     }
+
+    // ============================================================================
+    // Test 5: Distributed Shared Memory (Mapped Remote Store)
+    // ============================================================================
+
+    /// Test map_shared_rank_mut() followed by an ordinary Rust pointer store.
+    #[kernel]
+    #[cluster_launch(4, 1, 1)]
+    pub fn test_dsmem_mapped_store(mut output: DisjointSlice<u32>) {
+        static mut SHMEM: SharedArray<u32, 1> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let my_rank = cluster::block_rank();
+        let cluster_size = cluster::cluster_size();
+
+        if tid == 0 {
+            unsafe { (addr_of_mut!(SHMEM) as *mut u32).write(2000 + my_rank) };
+        }
+        thread::sync_threads();
+        cluster::cluster_sync();
+
+        if tid == 0 {
+            let neighbor_rank = (my_rank + 1) % cluster_size;
+            let neighbor_ptr = unsafe {
+                cluster::map_shared_rank_mut(addr_of_mut!(SHMEM) as *mut u32, neighbor_rank)
+            };
+            unsafe { *neighbor_ptr = 3000 + my_rank };
+        }
+
+        cluster::cluster_sync();
+
+        if tid == 0 {
+            let idx = my_rank as usize;
+            if idx < output.len() {
+                let local_value = unsafe { *(addr_of!(SHMEM) as *const u32) };
+                unsafe { *output.get_unchecked_mut(idx) = local_value };
+            }
+        }
+
+        cluster::cluster_sync();
+    }
 }
 
 // ============================================================================
@@ -198,7 +259,8 @@ mod kernels {
 // ============================================================================
 
 fn main() {
-    use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+    use cuda_core::simt::LaunchConfig;
+    use cuda_core::{CudaContext, DeviceBuffer};
 
     println!("=== Thread Block Cluster Tests (sm_90+) ===\n");
 
@@ -214,11 +276,7 @@ fn main() {
         return;
     }
 
-    let module = ctx
-        .load_module_from_file("cluster.ptx")
-        .expect("Load PTX module");
-    let module = kernels::from_module(module).expect("Failed to initialize typed CUDA module");
-
+    let module = kernels::load(&ctx).expect("Failed to load embedded CUDA module");
     let cluster_size = 4u32;
 
     // ====================================================================
@@ -232,8 +290,9 @@ fn main() {
     println!("Launching test_cluster_compile_time via cuLaunchKernelEx");
     println!("  Grid: 4x1x1, Block: 32, Cluster: 4x1x1\n");
 
-    module
-        .test_cluster_compile_time(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_cluster_compile_time(
             (stream).as_ref(),
             LaunchConfig {
                 grid_dim: (cluster_size, 1, 1),
@@ -242,7 +301,8 @@ fn main() {
             },
             &mut ct_output,
         )
-        .expect("Launch compile-time cluster kernel");
+    }
+    .expect("Launch compile-time cluster kernel");
     stream.synchronize().expect("Synchronize");
 
     let ct_results: Vec<u32> = ct_output.to_host_vec(&stream).unwrap();
@@ -289,8 +349,9 @@ fn main() {
     println!("Launching test_cluster_intrinsics...");
     println!("  Grid: 4x1x1 blocks, Block: 32 threads\n");
 
-    module
-        .test_cluster_intrinsics(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_cluster_intrinsics(
             (stream).as_ref(),
             LaunchConfig {
                 grid_dim: (n_blocks, 1, 1),
@@ -299,7 +360,8 @@ fn main() {
             },
             &mut output_dev,
         )
-        .expect("Launch kernel");
+    }
+    .expect("Launch kernel");
     stream.synchronize().expect("Synchronize");
 
     let output: Vec<u32> = output_dev.to_host_vec(&stream).unwrap();
@@ -333,8 +395,9 @@ fn main() {
     println!("Launching test_cluster_sync via cuLaunchKernelEx");
     println!("  Grid: 4x1x1, Block: 32, Cluster: 4x1x1\n");
 
-    module
-        .test_cluster_sync(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_cluster_sync(
             (stream).as_ref(),
             LaunchConfig {
                 grid_dim: (cluster_size, 1, 1),
@@ -343,7 +406,8 @@ fn main() {
             },
             &mut sync_output,
         )
-        .expect("Launch sync kernel");
+    }
+    .expect("Launch sync kernel");
     stream.synchronize().expect("Synchronize");
 
     let sync_results: Vec<u32> = sync_output.to_host_vec(&stream).unwrap();
@@ -371,15 +435,18 @@ fn main() {
     println!("  Grid: 4x1x1, Block: 32, Cluster: 4x1x1");
     println!("  Expected: Block 0 reads 1001, Block 1 reads 1002, ...\n");
 
-    let ring_result = module.test_dsmem_ring_exchange(
-        (stream).as_ref(),
-        LaunchConfig {
-            grid_dim: (cluster_size, 1, 1),
-            block_dim: (32, 1, 1),
-            shared_mem_bytes: 0,
-        },
-        &mut ring_output,
-    );
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    let ring_result = unsafe {
+        module.test_dsmem_ring_exchange(
+            (stream).as_ref(),
+            LaunchConfig {
+                grid_dim: (cluster_size, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &mut ring_output,
+        )
+    };
 
     let (ring_pass, dsmem_context_error) = match ring_result {
         Ok(_) => match stream.synchronize() {
@@ -435,15 +502,18 @@ fn main() {
         println!("  Grid: 4x1x1, Block: 32, Cluster: 4x1x1");
         println!("  Expected: Block 0 sums all blocks' values: 10+20+30+40 = 100\n");
 
-        let reduce_result = module.test_dsmem_reduction(
-            (stream).as_ref(),
-            LaunchConfig {
-                grid_dim: (cluster_size, 1, 1),
-                block_dim: (32, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            &mut reduce_output,
-        );
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        let reduce_result = unsafe {
+            module.test_dsmem_reduction(
+                (stream).as_ref(),
+                LaunchConfig {
+                    grid_dim: (cluster_size, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut reduce_output,
+            )
+        };
 
         match reduce_result {
             Ok(_) => match stream.synchronize() {
@@ -472,6 +542,71 @@ fn main() {
     }
 
     // ====================================================================
+    // Test 5: DSMEM mapped remote store
+    // ====================================================================
+
+    println!("=== Test 5: DSMEM Mapped Remote Store (cluster launch) ===\n");
+
+    let store_pass = if dsmem_context_error {
+        println!("⚠ Skipped - CUDA context corrupted by previous DSMEM error\n");
+        false
+    } else {
+        let mut store_output = DeviceBuffer::<u32>::zeroed(&stream, cluster_size as usize).unwrap();
+
+        println!("Launching test_dsmem_mapped_store via cuLaunchKernelEx");
+        println!("  Grid: 4x1x1, Block: 32, Cluster: 4x1x1");
+        println!("  Each block writes through a mapped pointer into its next rank\n");
+
+        let store_result = unsafe {
+            module.test_dsmem_mapped_store(
+                (stream).as_ref(),
+                LaunchConfig {
+                    grid_dim: (cluster_size, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut store_output,
+            )
+        };
+
+        match store_result {
+            Ok(_) => match stream.synchronize() {
+                Ok(()) => {
+                    let results: Vec<u32> = store_output.to_host_vec(&stream).unwrap();
+                    println!("Results (each block observes the write from its previous rank):");
+                    for (i, &val) in results.iter().enumerate() {
+                        let previous_rank = (i as u32 + cluster_size - 1) % cluster_size;
+                        let expected = 3000 + previous_rank;
+                        let status = if val == expected { "✓" } else { "?" };
+                        println!(
+                            "  Block {}: got {}, expected {} {}",
+                            i, val, expected, status
+                        );
+                    }
+                    results.iter().enumerate().all(|(i, &val)| {
+                        let previous_rank = (i as u32 + cluster_size - 1) % cluster_size;
+                        val == 3000 + previous_rank
+                    })
+                }
+                Err(e) => {
+                    println!("⚠ DSMEM mapped-store synchronize failed: {:?}", e);
+                    false
+                }
+            },
+            Err(e) => {
+                println!("⚠ Cluster launch failed: {:?}", e);
+                false
+            }
+        }
+    };
+
+    if store_pass {
+        println!("✓ DSMEM mapped remote store PASSED\n");
+    } else if !dsmem_context_error {
+        println!("⚠ DSMEM mapped remote store failed\n");
+    }
+
+    // ====================================================================
     // Summary
     // ====================================================================
 
@@ -481,7 +616,7 @@ fn main() {
     println!("  .explicitcluster");
     println!("  .reqnctapercluster 4, 1, 1\n");
 
-    let all_pass = ct_pass && sync_pass && ring_pass && reduce_pass;
+    let all_pass = ct_pass && sync_pass && ring_pass && reduce_pass && store_pass;
     if all_pass {
         println!("All cluster + DSMEM tests PASSED!");
     } else {
@@ -502,6 +637,10 @@ fn main() {
         println!(
             "  Test 4 (DSMEM reduction):        {}",
             if reduce_pass { "PASS" } else { "FAIL" }
+        );
+        println!(
+            "  Test 5 (DSMEM mapped store):     {}",
+            if store_pass { "PASS" } else { "FAIL" }
         );
         std::process::exit(1);
     }

@@ -140,7 +140,7 @@ Before any async operation can run, you initialize the thread-local device
 context:
 
 ```rust
-use cuda_async::device_context::init_device_contexts;
+use cuda_async::simt::device_context::init_device_contexts;
 
 init_device_contexts(0, 1)?;
 ```
@@ -170,7 +170,7 @@ the GPU works).
 Here is the full journey of an operation from construction to completion:
 
 ```text
-module.kernel_async(...)       ← build the recipe (no GPU work)
+module.kernel_async(&prepared, ...)  ← build a checked recipe (no GPU work)
         │
         ▼
   AsyncKernelLaunch            ← a DeviceOperation, lazy and stream-agnostic
@@ -245,16 +245,19 @@ let buf_b = DeviceBuffer::from_host(&main, &data_b)?;
 let child_1 = main.fork()?;
 let child_2 = main.fork()?;
 
-// Run independent work in parallel
-module.process(&child_1, cfg, &mut buf_a)?;
-module.process(&child_2, cfg, &mut buf_b)?;
+// SAFETY: cfg matches process's indexing/resources and both buffers' bounds.
+// Run independent work in parallel.
+unsafe {
+    module.process(&child_1, cfg, &mut buf_a)?;
+    module.process(&child_2, cfg, &mut buf_b)?;
+}
 
 // Join: main waits for both children
 main.join(&child_1)?;
 main.join(&child_2)?;
 
-// Now safe to use buf_a and buf_b on main
-module.combine(&main, cfg, &buf_a, &buf_b)?;
+// SAFETY: cfg matches combine's indexing/resources and both input bounds.
+unsafe { module.combine(&main, cfg, &buf_a, &buf_b) }?;
 ```
 
 The GPU timeline for this looks like:
@@ -294,10 +297,13 @@ timing requires events created **without** `CU_EVENT_DISABLE_TIMING` -- pass
 explicit flags to enable timing:
 
 ```rust
-use cuda_bindings::CUevent_flags_enum::CU_EVENT_DEFAULT;
+// bindgen flattens the CUDA enums, so the constant is a crate-root item
+// named after its enum, not a variant inside a module.
+use cuda_bindings::CUevent_flags_enum_CU_EVENT_DEFAULT as CU_EVENT_DEFAULT;
 
 let start = stream.record_event(Some(CU_EVENT_DEFAULT))?;
-module.my_kernel(&stream, config)?;
+// SAFETY: config and arguments satisfy my_kernel's requirements.
+unsafe { module.my_kernel(&stream, config) }?;
 let end = stream.record_event(Some(CU_EVENT_DEFAULT))?;
 end.synchronize()?;
 println!("Kernel took {:.2} ms", start.elapsed_ms(&end)?);
@@ -316,7 +322,7 @@ advanced optimization.
 
 | Situation                                     | Recommended approach                                 |
 |:----------------------------------------------|:-----------------------------------------------------|
-| Simple script, one kernel                     | `module.kernel_async(...).sync()`                    |
+| Simple script, one contracted kernel          | `module.kernel_async(&prepared, ...).sync()`         |
 | Multi-stage pipeline (GEMM → ReLU → D2H)      | `and_then` chain, policy picks one stream            |
 | Independent batches running concurrently      | `tokio::spawn` each batch, round-robin distributes   |
 | Debugging a suspected stream-ordering bug     | Switch to `SingleStream`                             |

@@ -172,16 +172,15 @@ mod kernels {
 // =============================================================================
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+    use cuda_core::simt::LaunchConfig;
+    use cuda_core::{CudaContext, DeviceBuffer};
 
     println!("=== GPU Printf Test (Unified) ===\n");
 
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
 
-    let module = ctx.load_module_from_file("printf.ptx")?;
-    let module = kernels::from_module(module).expect("Failed to initialize typed CUDA module");
-
+    let module = kernels::load(&ctx)?;
     let cfg = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (32, 1, 1),
@@ -192,7 +191,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 1: Integer formats
     // ====================================================================
     println!("--- Test 1: Integer formats ---");
-    module.test_integers((stream).as_ref(), cfg)?;
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.test_integers((stream).as_ref(), cfg) }?;
     stream.synchronize()?;
     println!();
 
@@ -200,7 +200,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 2: Float formats
     // ====================================================================
     println!("--- Test 2: Float formats ---");
-    module.test_floats((stream).as_ref(), cfg)?;
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.test_floats((stream).as_ref(), cfg) }?;
     stream.synchronize()?;
     println!();
 
@@ -208,7 +209,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 3: Width and alignment
     // ====================================================================
     println!("--- Test 3: Width and alignment ---");
-    module.test_width_align((stream).as_ref(), cfg)?;
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.test_width_align((stream).as_ref(), cfg) }?;
     stream.synchronize()?;
     println!();
 
@@ -216,7 +218,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 4: Sign and flags
     // ====================================================================
     println!("--- Test 4: Sign and flags ---");
-    module.test_flags((stream).as_ref(), cfg)?;
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.test_flags((stream).as_ref(), cfg) }?;
     stream.synchronize()?;
     println!();
 
@@ -228,7 +231,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let data: Vec<f32> = vec![1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8];
         let data_dev = DeviceBuffer::from_host(&stream, &data)?;
 
-        module.test_thread_output((stream).as_ref(), cfg, &data_dev)?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_thread_output((stream).as_ref(), cfg, &data_dev) }?;
         stream.synchronize()?;
     }
     println!();
@@ -237,7 +241,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 6: Return value
     // ====================================================================
     println!("--- Test 6: Return value ---");
-    module.test_return_value((stream).as_ref(), cfg)?;
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.test_return_value((stream).as_ref(), cfg) }?;
     stream.synchronize()?;
     println!();
 
@@ -245,7 +250,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 7: Boolean values
     // ====================================================================
     println!("--- Test 7: Boolean values ---");
-    module.test_booleans((stream).as_ref(), cfg)?;
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.test_booleans((stream).as_ref(), cfg) }?;
     stream.synchronize()?;
     println!();
 

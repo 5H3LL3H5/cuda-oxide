@@ -8,8 +8,8 @@ pointing at the same output buffer. The borrow checker was not designed for
 this.
 
 cuda-oxide solves the problem in layers. The common case -- one thread writes
-one element -- is safe by construction, no `unsafe` required. The uncommon
-cases -- shared memory, warp shuffles, hardware intrinsics -- require
+one element under a checked launch contract -- is safe by construction.
+Uncommon cases -- shared memory, warp shuffles, hardware intrinsics -- require
 `unsafe` with documented contracts. And the frontier cases -- TMA, tensor
 cores, cluster-level communication -- are fully manual, matching the
 complexity of the hardware they control.
@@ -26,7 +26,7 @@ compiler can verify:
 
 | Tier       | Description                                             | `unsafe` Required? |
 |:-----------|:--------------------------------------------------------|:-------------------|
-| **Tier 1** | Safe by construction -- the type system prevents misuse | No                 |
+| **Tier 1** | Safe kernel body plus a checked `PreparedLaunch`        | No                 |
 | **Tier 2** | Explicit `unsafe` with clear safety contracts           | Yes, scoped        |
 | **Tier 3** | Raw hardware intrinsics -- full user responsibility     | Yes, pervasive     |
 
@@ -41,8 +41,8 @@ rarely leave Tier 2.
 
 ### The core idea: `DisjointSlice<T>` + `ThreadIndex`
 
-The primary safety abstraction is a pair of types that together guarantee
-race-free parallel writes without `unsafe` at the call site:
+The primary device-side safety abstraction is a pair of types that together
+support race-free parallel writes:
 
 - **`ThreadIndex<'kernel, IndexSpace>`** -- an opaque witness around a
   `usize`, with no public constructor. The only way to obtain one is
@@ -58,10 +58,10 @@ race-free parallel writes without `unsafe` at the call site:
   matches its own. Returns `Option<&mut T>` -- `None` for out-of-bounds
   indices.
 
-Put them together and you get a kernel with zero `unsafe`:
+Put them together and you get a kernel body with zero `unsafe`:
 
 ```rust
-use cuda_device::{kernel, DisjointSlice};
+use cuda_device::{DisjointSlice, kernel};
 
 #[kernel]
 pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
@@ -88,37 +88,118 @@ pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
 }
 ```
 
-Safety follows from four facts:
+Safety follows from five facts:
 
-1. `index_1d()` produces a unique value per thread (hardware guarantee:
-   `threadIdx.x < blockDim.x`, so the linear index
-   `blockIdx.x * blockDim.x + threadIdx.x` is unique across the grid).
+1. `index_1d()` uses only X coordinates. Its value is unique when block and
+   grid Y/Z dimensions are all 1. A `domain = 1` prepared launch proves that;
+   without that typed proof, the device checks Y/Z and marks the witness
+   invalid when either axis is active. Safe slice access then returns `None`.
 2. `get_mut()` is bounds-checked -- out-of-range threads get `None`.
 3. The `IndexSpace` parameter ties each witness to its layout: a
    `DisjointSlice<T, Index2D<128>>` will not accept a
    `ThreadIndex<'_, Index2D<256>>` -- mixing strides is a compile error.
 4. The witness is `!Send + !Sync + !Copy + !Clone` and `'kernel`-scoped,
    so threads cannot launder each other's indices through shared memory.
+5. A checked `PreparedLaunch<K>` ties the host geometry to the exact kernel.
 
 The borrow checker sees a single `&mut T` per thread. The hardware
-guarantees the indices are disjoint. The type system ties the two together.
+provides the coordinates; the launch proof makes their linearization disjoint.
+The type system ties the device and host proofs together.
+
+```text
+1D prepared launch: Y=Z=1 -> index_1d values are unique -> safe get_mut
+raw 2D launch:       active Y/Z -> invalid witness -> safe get_mut returns None
+```
+
+A raw launch is still `unsafe`: the host must uphold its other memory and
+launch obligations even though this rank check fails closed on the device.
 
 ### Trusted index functions
 
 `ThreadIndex` is only as trustworthy as the functions that create it. Here
 are the constructors cuda-oxide provides:
 
-| Function                      | Formula                                 | Return Type                                            | Notes                                            |
-|:------------------------------|:----------------------------------------|:-------------------------------------------------------|:-------------------------------------------------|
-| `index_1d()`                  | `blockIdx.x * blockDim.x + threadIdx.x` | `ThreadIndex<'kernel, Index1D>`                        | Unconditionally unique per thread                |
-| `index_2d::<S>()`             | `row * S + col`                         | `Option<ThreadIndex<'kernel, Index2D<S>>>`             | Const stride; mixing strides is a compile error  |
-| `unsafe index_2d_runtime(s)`  | `row * s + col`                         | `Option<ThreadIndex<'kernel, Runtime2DIndex>>`         | Caller asserts every thread used the same `s`    |
-| `index_2d_row()`              | `blockIdx.y * blockDim.y + threadIdx.y` | `usize`                                                | Component accessor, not a witness constructor    |
-| `index_2d_col()`              | `blockIdx.x * blockDim.x + threadIdx.x` | `usize`                                                | Component accessor, not a witness constructor    |
+| Function                      | Formula                                 | Return Type                                   | Notes                                            |
+|:------------------------------|:----------------------------------------|:----------------------------------------------|:-------------------------------------------------|
+| `index_1d()`                  | `blockIdx.x * blockDim.x + threadIdx.x` | `ThreadIndex<'kernel, Index1D>`               | Invalid when an untyped launch has active Y/Z    |
+| `index_2d::<S>()`             | `row * S + col`                         | `Option<ThreadIndex<'kernel, Index2D<S>>>`    | Const stride; mixing strides is a compile error  |
+| `index_2d_runtime(&slice)`    | `row * width + col`                     | `Option<ThreadIndex<'kernel, Runtime2DIndex>>`| Row width read from the slice, bound by the host |
+| `index_2d_row()`              | `blockIdx.y * blockDim.y + threadIdx.y` | `usize`                                       | Component accessor, not a witness constructor    |
+| `index_2d_col()`              | `blockIdx.x * blockDim.x + threadIdx.x` | `usize`                                       | Component accessor, not a witness constructor    |
 
 `index_2d_row()` and `index_2d_col()` return plain `usize` -- they give
 you the components for arithmetic, but cannot be used to index into a
 `DisjointSlice`. Only the linearized result earns a `ThreadIndex`.
+Likewise, 2D uniqueness assumes the launch has no active Z dimension. A
+`domain = 2` prepared launch proves that. Without a typed proof, the device
+checks Z and returns `None` when it is active.
+
+(check-a-tile-once)=
+### Check a tile once
+
+For a small fixed tile, one bounds check can cover every element in that tile:
+
+```rust
+use cuda_device::{DisjointSlice, LinearTiles, kernel, launch_contract, thread};
+
+#[kernel(launch_context = launch_context)]
+#[launch_contract(
+    domain = 1,
+    coordinates = u32,
+    block = (64, 1, 1),
+)]
+pub fn add_one(mut values: DisjointSlice<u32, LinearTiles<4>>) {
+    let thread_index = thread::index_1d_u32(launch_context);
+
+    if let Some(mut tile) = values.tile_thread32(thread_index) {
+        let first = tile.at_const::<0>().read();
+        tile.at_const::<0>().write(first + 1);
+
+        let second = tile.at_const::<1>().read();
+        tile.at_const::<1>().write(second + 1);
+    }
+}
+```
+
+`LinearTiles<4>` gives thread 0 elements 0--3, thread 1 elements 4--7,
+and so on. `tile_thread32` checks the complete four-element tile once. If only
+part of a tile fits, it returns `None`. Constant positions such as
+`at_const::<0>()` need no further runtime bounds check; an invalid constant
+fails compilation.
+
+The two annotations provide the checked facts:
+
+- `#[kernel(launch_context = launch_context)]` creates a local device value
+  carrying facts about this launch. It is not a kernel argument.
+- `domain = 1` says only the X axis is active.
+- `coordinates = u32` allows `thread::index_1d_u32(launch_context)`, which
+  returns this thread's unique index across the full 1-D launch as a `u32`.
+- `block = (64, 1, 1)` requires exactly 64 threads in each block. The launch
+  may still contain many blocks.
+
+An exact `block` is checked twice, in two places that fail independently.
+Preparation rejects a mismatched launch configuration on the host, before any
+driver call. The shape also reaches the device compiler, which emits
+`.reqntid 64, 1, 1`, so the CUDA driver refuses any launch whose block differs
+on any axis. The second check covers the paths the first one cannot see: an
+`unsafe` raw launch, and a module whose loaded PTX is not the artifact the
+generated Rust markers describe.
+
+`.reqntid` replaces `.maxntid` for a contracted kernel. ptxas rejects an entry
+declaring both, and an exact shape already bounds the thread count. A kernel
+carrying only `#[launch_bounds]` keeps `.maxntid`, which bounds the product
+`x * y * z` and admits every shape reaching it. That difference is the reason a
+thread bound cannot stand in for a block shape: under `.maxntid 64, 1, 1` the
+driver accepts `(8, 8, 1)` and `(4, 4, 4)` alongside `(64, 1, 1)`.
+
+For 2-D tiles, use `thread::coord_2d_u32(launch_context)` with
+`RowMajorTiles<ROWS, COLS, ROW_STRIDE>`. `ROW_STRIDE` is the logical row width
+in elements and must match the buffer's layout. The buffer length does not
+have to be a multiple of the row width; only complete tiles are returned.
+
+See the runnable
+[`proof_carrying_views`](https://github.com/NVlabs/cuda-oxide/tree/main/crates/rustc-codegen-cuda/examples/proof_carrying_views)
+example for 1-D and 2-D versions.
 
 ### How `index_2d` is type-safe
 
@@ -149,23 +230,115 @@ lifetime is borrowed from a stack-local scope the macros inject -- so a
 thread can't park its `ThreadIndex` in shared memory and have a neighbour
 pick it up later, and the witness can't outlive the kernel body.
 
-#### Truly runtime strides: `unsafe index_2d_runtime`
+#### Truly runtime strides: `index_2d_runtime`
 
 Some kernels really do receive their stride at launch time
-(e.g. matrix dimensions known only on the host). For those cases there's
-a corresponding witness `Runtime2DIndex` and an `unsafe` constructor:
+(e.g. matrix dimensions known only on the host). For those cases there is a
+corresponding witness `Runtime2DIndex`, minted from the slice the index will
+address:
 
 ```rust
-let idx = unsafe { thread::index_2d_runtime(n)? };
+let idx = thread::index_2d_runtime(&c)?;
 ```
 
-The `unsafe` is the contract: every thread in the kernel that feeds a
-`Runtime2DIndex` into the same `DisjointSlice<T, Runtime2DIndex>` must
-have used the same `n`. The type system *can't* prove this -- two
-`ThreadIndex<'_, Runtime2DIndex>` values produced under different
-runtime strides have the same type. If you can pin the stride at compile
-time, prefer `index_2d::<S>()`. If you can't, the `unsafe` keyword on
-`index_2d_runtime` is the marker that the safety obligation is yours.
+No `unsafe`, because there is no per-call stride to disagree about. The row
+width travels inside the slice, written once by the host into the launch packet, so
+every thread that indexes `c` uses the same row width by construction. Passing
+the stride separately could not give that: two `ThreadIndex<'_, Runtime2DIndex>`
+values produced under different runtime strides have the same type, so the
+type system cannot tell them apart. If you can pin the stride at compile time,
+prefer `index_2d::<S>()`.
+
+One consequence shapes the witness itself. Two `Runtime2DIndex` slices in one
+kernel may carry different row widths, and their witnesses share a type, so
+safe code can mint a witness from each and hand either one to either slice. The
+witness therefore stores the thread's raw `(row, col)` coordinates rather than
+a flat index, and `get_mut` resolves them against the **addressed** slice's
+own row width (`row * width + col`, requiring `col < width`). Distinct threads
+hold distinct coordinates and every thread reads the same host-bound width
+from the slice it addresses, so the mapping stays injective per slice no
+matter which slice minted the witness. A flat index baked in at minting time
+would instead smuggle the minting slice's grid across: `(1, 0)` flattened at
+width 5 and `(0, 5)` flattened at width 100 both name element 5.
+
+#### Where a runtime row width lives
+
+The *launch* establishes "every thread saw the same value": the host marshals
+one word into the launch packet, and every thread of every block reads those
+same bytes. A kernel body has no comparable way to establish it about one of
+its own locals.
+
+So a slice whose index space carries a runtime row width receives that width
+the same way. On the host, `RowWidth` binds it:
+
+```rust
+module.write_c(&stream, &prepared, cuda_host::RowWidth::new(&mut c, n))?;
+```
+
+and on the device the accessor reads it back with no argument of its own:
+
+```rust
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 2, coordinates = u32, block = (16, 16, 1))]
+pub fn write_c(mut c: DisjointSlice<f32, RuntimeRowMajorTiles<1, 1>>) {
+    let coord = thread::coord_2d_u32(lc);
+    // No `unsafe`: the row width came from the host, bound to `c`.
+    if let Some(mut cell) = c.tile_2d32_rt(coord) {
+        cell.at_const::<0, 0>().write(1.0);
+    }
+}
+```
+
+Why this is enough: under one row width per slice the `last_col < stride`
+check keeps each tile inside one logical row, which makes the
+coordinate-to-offset mapping injective, so distinct threads own disjoint
+elements. Two threads disagreeing about the width is exactly the case that
+breaks it. With 1x1 tiles,
+thread `(1, 0)` at stride 5 resolves flat index 5, and thread `(0, 5)` at
+stride 100 also resolves 5: one element, two `&mut`.
+
+A width supplied per call cannot rule that out even when each candidate value
+is itself launch-uniform, because safe code can select between two of them
+under a thread-varying condition, or pass different ones at two call sites on
+one slice. Binding at the host boundary removes the choice.
+
+The bound value still has to be the row width the buffer actually uses for
+the kernel to compute the intended result. That is a correctness requirement
+rather than a safety one; a width that misdescribes the layout gives wrong
+answers inside the slice, never aliasing or an out-of-bounds access.
+
+#### Launch-uniform scalars: `Uniform<T>`
+
+The same reasoning applies to any scalar a kernel needs to be the same in
+every thread, not only to a row width. `Uniform<T>` is that fact as a type.
+Declare the parameter and the obligation is discharged by the kernel ABI:
+
+```rust
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 2, coordinates = u32, block = (16, 16, 1))]
+pub fn write_c(rows: Uniform<u32>, mut c: DisjointSlice<f32, RuntimeRowMajorTiles<1, 1>>) {
+    let coord = thread::coord_2d_u32(lc);
+    if coord.row() >= rows.get() {
+        return;
+    }
+    if let Some(mut cell) = c.tile_2d32_rt(coord) {
+        cell.at_const::<0, 0>().write(1.0);
+    }
+}
+```
+
+The host method still takes a plain `u32`; `#[cuda_module]` wraps it, and
+`#[repr(transparent)]` keeps the launch packet byte-identical. There is no
+constructor, so device code cannot promote a per-thread value into a witness.
+`Uniform::new_unchecked` remains for a value proven uniform some other way, and
+`block_dim_x()` and its siblings return witnesses directly, since a launch has
+one block shape.
+
+Uniformity is closed under arithmetic whose operands are all uniform, so a
+derived value keeps the witness. It is not closed under selection: choosing
+between two uniform values on a thread-varying condition gives a value that
+differs between threads, which is why a witness of this kind cannot carry a
+proof that has to hold across a whole slice.
 
 ### The GEMM pattern
 
@@ -189,17 +362,16 @@ pub fn gemm(a: &[f32], b: &[f32], mut c: DisjointSlice<f32, Index2D<STRIDE>>, m:
 }
 ```
 
-For runtime strides, the same shape works but the linearisation step is
-explicit and `unsafe`:
+For runtime strides, the same shape works and stays safe; the row width comes
+from the output slice rather than from a const generic:
 
 ```rust
 #[kernel]
 pub fn gemm_runtime(a: &[f32], b: &[f32], mut c: DisjointSlice<f32, Runtime2DIndex>, m: u32, n: u32) {
-    let n = n as usize;             // ONE binding, ONE stride value
     let row = thread::index_2d_row();
 
-    // SAFETY: every thread in the kernel sees the same `n` (kernel arg).
-    if let Some(c_idx) = unsafe { thread::index_2d_runtime(n) } {
+    // The row width comes from `c`, bound once by the host. No `unsafe`.
+    if let Some(c_idx) = thread::index_2d_runtime(&c) {
         if row < m as usize {
             // ... compute dot product ...
             if let Some(c_elem) = c.get_mut(c_idx) {
@@ -214,16 +386,22 @@ The `if let Some` from `index_2d_runtime` replaces the manual `col < n`
 guard you'd write in CUDA C++. The `row < m` check remains because it
 guards against reading garbage from the input matrices.
 
+That covers writing the output. The *input* side of GEMM -- and the cost
+of the bounds checks on every `a[...]` read -- has its own chapter:
+[Bounds Checks: Pay Once or Opt Out](bounds-checks.md).
+
 ### What makes a kernel Tier 1
 
-A kernel is fully safe -- Tier 1 -- when:
+A kernel and its launch are fully safe -- Tier 1 -- when:
 
 1. All mutable output access goes through `DisjointSlice::get_mut(ThreadIndex)`
 2. All inputs are shared immutable references (`&[T]`)
 3. No shared memory, no raw pointers, no intrinsics beyond thread indexing
+4. The host uses a matching checked `PreparedLaunch<K>`
 
 Examples in this tier include `vecadd`, `helper_fn`, `generic`, `host_closure`,
-and the naive GEMM kernels in the `gemm` and `async_mlp` examples.
+and the naive GEMM kernels in the `gemm` and `async_mlp` examples when launched
+through matching contracts. Their raw `LaunchConfig` paths remain unsafe.
 
 ---
 
@@ -310,8 +488,12 @@ from a raw pointer requires the caller to guarantee that the pointer is
 valid and properly aligned:
 
 ```rust
-let atom = unsafe { DeviceAtomicU32::new(ptr) };
-atom.fetch_add(1, Ordering::Relaxed);  // safe call
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+
+// `from_ptr` is the unsafe constructor: it reinterprets existing memory.
+// `DeviceAtomicU32::new(value)` is the safe one, for an owned static.
+let atom = unsafe { DeviceAtomicU32::from_ptr(ptr) };
+atom.fetch_add(1, AtomicOrdering::Relaxed);  // safe call
 ```
 
 ### Unchecked slice access
@@ -333,6 +515,10 @@ automatically: index in bounds, no two threads share the same index. The
 difference is that you prove it yourself instead of letting the type system
 do it for you.
 
+This is per-access. To remove the checks behind ordinary `a[i]` indexing
+for a whole kernel at once, see the `unchecked_indexing` flag in
+[Bounds Checks: Pay Once or Opt Out](bounds-checks.md).
+
 ---
 
 ## Tier 3: raw hardware
@@ -343,14 +529,14 @@ architectures. Every call is `unsafe`, the safety contracts are complex
 and architecture-dependent, and the documentation lives in the PTX ISA
 manual more than in Rust doc comments.
 
-| Feature                              | Key APIs                                                      | Architectures      |
-|:-------------------------------------|:--------------------------------------------------------------|:-------------------|
-| **TMA** (Tensor Memory Accelerator)  | `tma_load_2d`, `tma_store_2d`, `TmaDescriptor`                | sm_90+ (Hopper)    |
-| **tcgen05** (Tensor Core Gen 5)      | `tcgen05_mma`, `tcgen05_commit`, `TensorMemoryHandle`         | sm_120 (Blackwell) |
-| **WGMMA** (Warpgroup MMA)            | `wgmma_mma_async`, `wgmma_commit_group`, `wgmma_wait_group`   | sm_90+ (Hopper)    |
-| **Cluster**                          | `cluster_rank`, `map_shared_rank`, `cluster_barrier_arrive`   | sm_90+ (Hopper)    |
-| **CLC** (Cluster Launch Control)     | `clc_prefetch`, `clc_query_channel`                           | sm_120 (Blackwell) |
-| **TMEM** (Tensor Memory)             | `TmemGuard` (typestate), `tmem_alloc`, `tmem_dealloc`         | sm_120 (Blackwell) |
+| Feature                              | Key APIs                                                      | Architectures          |
+|:-------------------------------------|:--------------------------------------------------------------|:-----------------------|
+| **TMA** (Tensor Memory Accelerator)  | `tma_load_2d`, `tma_store_2d`, `TmaDescriptor`                | sm_90+ (Hopper)        |
+| **tcgen05** (Tensor Core Gen 5)      | `tcgen05_mma`, `tcgen05_commit`, `TensorMemoryHandle`         | sm_100a (Blackwell DC) |
+| **WGMMA** (Warpgroup MMA)            | `wgmma_mma_async`, `wgmma_commit_group`, `wgmma_wait_group`   | sm_90+ (Hopper)        |
+| **Cluster**                          | `cluster_rank`, `map_shared_rank`, `cluster_barrier_arrive`   | sm_90+ (Hopper)        |
+| **CLC** (Cluster Launch Control)     | `clc_prefetch`, `clc_query_channel`                           | sm_100+ (Blackwell)    |
+| **TMEM** (Tensor Memory)             | `TmemGuard` (typestate), `tmem_alloc`, `tmem_dealloc`         | sm_100a (Blackwell DC) |
 
 If you are writing application-level kernels, you should not need Tier 3
 APIs. They exist for the people building the next CUTLASS -- and for those
@@ -376,7 +562,7 @@ provides on the CPU is also enforced on the GPU:
 | Guarantee                            | How It Works                                                                                                                                             |
 |:-------------------------------------|:---------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **Ownership and borrowing**          | Lifetime errors, use-after-free, and aliasing violations caught at compile time                                                                          |
-| **Safe parallel writes**             | `DisjointSlice<T>` + `ThreadIndex` -- type-level proof that writes do not race                                                                           |
+| **Safe parallel writes**             | `DisjointSlice<T>` + `ThreadIndex` + matching prepared geometry prove that writes do not race                                                            |
 | **Explicit `unsafe` scoping**        | Raw pointer access requires `unsafe`, making obligations visible and auditable                                                                           |
 | **Convergent attribute enforcement** | Sync primitives (barriers, fences, shuffles) marked `convergent` in the IR, preventing the optimizer from moving or duplicating them across control flow |
 
@@ -442,6 +628,10 @@ extended, not reinvented:
 | **Memory views**                      | Generalized parallel access patterns -- like `DisjointSlice` but covering blocked, striped, transposed, and composed layouts. Type-checked race-freedom at scale. |
 | **Extended borrow checking for sync** | Statically enforce that barriers cannot be forgotten, placed at divergent control flow, or duplicated by the optimizer. Convergence in the type system.           |
 
+The first pieces of the memory-views idea have landed: row and column
+read views over runtime-sized matrices, and runtime-width output tiles.
+[Bounds Checks: Pay Once or Opt Out](bounds-checks.md) covers them.
+
 All of this is compile-time analysis. The generated PTX is identical to what
 you would write by hand -- the safety net disappears at code generation.
 Zero runtime cost.
@@ -484,19 +674,23 @@ The rules:
 
 - Use `DisjointSlice` for all mutable outputs.
 - Use `&[T]` for all read-only inputs.
-- For 1D grids, default to `get_mut_indexed()`. If you need the index for
+- For 1D grids, declare `launch_contract(domain = 1, ...)` and use a prepared
+  launch. Inside the kernel, default to `get_mut_indexed()`. If you need the index for
   arithmetic against multiple slices, fall back to the explicit pair:
   `let idx = thread::index_1d(); slice.get_mut(idx)`.
 - For const-stride 2D grids, parameterise the slice as
   `DisjointSlice<T, Index2D<S>>` and use `get_mut_indexed()` or
   `thread::index_2d::<S>()`. Mismatched strides are a compile error.
-- For runtime strides, reach for `unsafe { thread::index_2d_runtime(n) }`
-  with a `Runtime2DIndex`-tagged slice. The `unsafe` is the contract that
-  every thread used the same `n`.
+- For runtime strides, reach for `thread::index_2d_runtime(&slice)` with a
+  `Runtime2DIndex`-tagged slice. The row width travels inside the slice,
+  bound once by the host, so no `unsafe` and no per-call stride to disagree
+  about.
 - Always bounds-check via `get_mut()` / `get_mut_indexed()` (both return
   `Option`).
 
-If your kernel compiles without `unsafe`, it is race-free by construction.
+If the kernel body compiles without `unsafe`, it satisfies the device-side
+part of the proof. Race freedom also requires a matching prepared launch, or
+an explicit unsafe proof for a raw configuration.
 
 ### When you need `unsafe`
 
@@ -541,9 +735,9 @@ the code until the argument is obvious, or use a safe API instead.
 | Property                                                        | Status                                               |
 |:----------------------------------------------------------------|:-----------------------------------------------------|
 | Borrow checker on device code                                   | Enforced (real `rustc` frontend)                     |
-| Safe 1D parallel writes (`DisjointSlice + index_1d`)            | Enforced                                             |
+| Safe 1D parallel writes (`DisjointSlice + index_1d`)            | Enforced with a `domain = 1` prepared launch         |
 | Safe 2D parallel writes -- const stride                         | Enforced (`Index2D<S>` mismatch is a compile error)  |
-| Safe 2D parallel writes -- runtime stride                       | Caller-asserted via `unsafe index_2d_runtime`        |
+| Safe 2D parallel writes -- runtime stride                       | Enforced (host-bound row width, per-slice resolution)|
 | `ThreadIndex` non-transferable across threads (smem laundering) | Enforced (`!Send + !Sync + !Copy + !Clone + 'kernel`)|
 | `&mut [T]` kernel parameter                                     | NOT enforced -- treat any `&mut` arg as `unsafe`     |
 | Explicit `unsafe` for shared memory, intrinsics                 | Enforced (Rust language rules)                       |
@@ -559,7 +753,7 @@ prevent. Until the macro rejects `&mut [T]` outright (or rewrites it to
 `DisjointSlice`), treat any kernel that takes one as if every line in it
 were `unsafe`.
 
-The safety model is designed to make the common case safe by default while
-providing explicit escape hatches for everything else. Write your kernel,
-let the type system catch the races, and save `unsafe` for the parts where
-you genuinely know something the compiler does not.
+The safety model is designed to make the common case safe through a kernel
+body plus a prepared launch, while providing explicit escape hatches for
+everything else. Use `unsafe` only when you are supplying a proof that the
+compiler and launch contract do not carry.

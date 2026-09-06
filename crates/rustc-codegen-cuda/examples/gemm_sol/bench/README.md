@@ -34,19 +34,32 @@ the correct baseline: **4K=1502, 8K=1402, 16K=1526 TFLOPS**.
 ## Requirements
 
 - **GPU**: Blackwell (sm_100+). Tested on B200.
-- **CUDA Toolkit**: 12.8+ (needs `libcudart.so`, `libcublasLt.so` on `LD_LIBRARY_PATH`)
+- **CUDA Toolkit**: 13.0+ (needs `libcudart.so`, `libcublasLt.so` on `LD_LIBRARY_PATH`)
 - **Python**: 3.12+ (for Python benchmarks only)
 
 ## Setup
 
 ### cublasLt benchmark (recommended, no Python deps)
 
+The packaged `build.sh` figures out CUDA paths (honoring `CUDA_HOME` /
+`CUDA_PATH`, then falling back to `/usr/local/cuda`) and rpath-pins the
+right lib directory. Use it inside `nix develop` or with a system CTK:
+
 ```bash
 cd bench/
-gcc -O2 -o cublaslt_bench cublaslt_bench.c \
-    -I/usr/local/cuda/include -L/usr/local/cuda/lib64 \
-    -lcublasLt -lcudart -lm
+bash build.sh
 ./cublaslt_bench
+```
+
+`gemm_sol/src/main.rs` will pick this binary up automatically and use it as
+its live cublasLt baseline (replacing the previously hardcoded B200
+constants). The raw `gcc` invocation still works if you prefer:
+
+```bash
+gcc -O2 -o cublaslt_bench cublaslt_bench.c \
+    -I"$CUDA_HOME/include" -L"$CUDA_HOME/lib" \
+    -lcublasLt -lcudart -lm \
+    -Wl,-rpath,"$CUDA_HOME/lib"
 ```
 
 ### cuBLAS (legacy) + CUTLASS benchmarks

@@ -15,7 +15,8 @@
 //! Build and run with:
 //!   cargo oxide run sharedmem
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::simt::LaunchConfig;
+use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 use cuda_host::cuda_module;
 
@@ -91,11 +92,7 @@ fn main() {
     // Test size - must match TILE size (256 elements)
     const N: usize = 256;
 
-    let module = ctx
-        .load_module_from_file("sharedmem.ptx")
-        .expect("Failed to load PTX module");
-    let module = kernels::from_module(module).expect("Failed to initialize typed CUDA module");
-
+    let module = kernels::load(&ctx).expect("Failed to load embedded CUDA module");
     // Launch config for shared memory kernels
     let cfg = LaunchConfig {
         grid_dim: (1, 1, 1),
@@ -113,8 +110,8 @@ fn main() {
         let data_dev = DeviceBuffer::from_host(&stream, &data_host).unwrap();
         let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
 
-        module
-            .shared_test((stream).as_ref(), cfg, &data_dev, &mut out_dev)
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.shared_test((stream).as_ref(), cfg, &data_dev, &mut out_dev) }
             .expect("Kernel launch failed");
 
         let out_result = out_dev.to_host_vec(&stream).unwrap();
@@ -148,8 +145,8 @@ fn main() {
         let b_dev = DeviceBuffer::from_host(&stream, &b_host).unwrap();
         let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
 
-        module
-            .shared_dual((stream).as_ref(), cfg, &a_dev, &b_dev, &mut out_dev)
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.shared_dual((stream).as_ref(), cfg, &a_dev, &b_dev, &mut out_dev) }
             .expect("Kernel launch failed");
 
         let out_result = out_dev.to_host_vec(&stream).unwrap();

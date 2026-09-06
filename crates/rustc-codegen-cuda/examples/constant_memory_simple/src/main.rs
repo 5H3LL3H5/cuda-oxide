@@ -8,7 +8,8 @@
 //! Build and run with:
 //!   cargo oxide run constant_memory_simple
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::simt::LaunchConfig;
+use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_device::{ConstantMemory, DisjointSlice, constant, cuda_module, kernel, thread};
 
 #[cuda_module]
@@ -40,10 +41,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     module.set_scale(&stream, &3.0)?;
 
     let mut out = DeviceBuffer::<f32>::zeroed(&stream, 8)?;
-    module.multiply(&stream, LaunchConfig::for_num_elems(8), &mut out)?;
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe { module.multiply(&stream, LaunchConfig::for_num_elems(8), &mut out) }?;
 
     let result = out.to_host_vec(&stream)?;
     println!("{:?}", result);
-    assert_eq!(result, vec![0.0, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0]);
+
+    let expected = vec![0.0, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0];
+    assert_eq!(
+        result, expected,
+        "constant_memory_simple: kernel output mismatch"
+    );
+    println!(
+        "✓ SUCCESS: constant-memory scale applied correctly ({} elements)",
+        result.len()
+    );
     Ok(())
 }

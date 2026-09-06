@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! `dialect-mir` → `dialect-llvm` operation conversion.
+//! `dialect-mir` → LLVM dialect operation conversion.
 //!
 //! Each MIR/NVVM op implements `MirToLlvmConversion` (see
 //! [`crate::conversion_interface`]) via `#[op_interface_impl]` blocks in
@@ -26,8 +26,27 @@
 //! 2. Write a `pub(crate) fn convert_*` function in the relevant submodule.
 //! 3. Add an `#[op_interface_impl]` block in [`interface_impls`].
 
+use pliron::{
+    context::{Context, Ptr},
+    location::Located,
+    operation::Operation,
+};
+
+/// Copy the source operation's location to an operation created while lowering it.
+pub(crate) fn preserve_location(
+    ctx: &mut Context,
+    source: Ptr<Operation>,
+    lowered: Ptr<Operation>,
+) -> Ptr<Operation> {
+    lowered.deref_mut(ctx).set_loc(source.deref(ctx).loc());
+    lowered
+}
+
+pub(crate) mod enum_payload_storage;
+mod generated_intrinsics;
 pub mod interface_impls;
 pub mod intrinsics;
 pub mod ops;
+pub(crate) mod target_stable_storage;
 pub mod type_interface_impls;
 pub mod types;

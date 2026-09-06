@@ -35,7 +35,7 @@
 //!
 //! # Function Name Resolution
 //!
-//! [`extract_func_info`] uses `CrateDef::name()` which returns fully qualified
+//! `extract_func_info` uses `CrateDef::name()` which returns fully qualified
 //! names (FQDNs, e.g. `helper_fn::cuda_oxide_device_<hash>_vecadd`). This FQDN is
 //! used as both `pattern_name` (for intrinsic matching against paths like
 //! `cuda_device::thread::threadIdx_x`) and `call_name` (for non-generic calls).
@@ -54,30 +54,33 @@
 //!   - `tma`: Tensor memory access
 //!   - `memory`: SharedArray indexing, stmatrix
 
+pub mod drop_glue;
 pub mod helpers;
 pub mod intrinsics;
 
 use super::types;
 use crate::error::{TranslationErr, TranslationResult};
+use crate::translator::facts::{
+    eval_usize_const, is_cuda_device_fn, is_std_precondition_check, self_ty_is_shared_array,
+};
+use crate::translator::location::span_to_location;
 use crate::translator::rvalue;
-use crate::translator::values::ValueMap;
+use crate::translator::values::{ValueMap, maybe_ptr_coerce};
+use dialect_mir::attributes::{MirCastKindAttr, MirPointerKindAuthorityAttr};
 use dialect_mir::ops::{
     MirAssertOp, MirCondBranchOp, MirConstantOp, MirEqOp, MirGotoOp, MirNotOp, MirReturnOp,
-};
-use dialect_nvvm::ops::{
-    ReadPtxSregCtaidXOp, ReadPtxSregCtaidYOp, ReadPtxSregNtidXOp, ReadPtxSregNtidYOp,
-    ReadPtxSregTidXOp, ReadPtxSregTidYOp,
+    MirUnrollHintOp,
 };
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::OperandSegmentInterface;
-use pliron::builtin::types::{IntegerType, Signedness};
+use pliron::builtin::types::{FunctionType, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::identifier::Legaliser;
 use pliron::linked_list::ContainsLinkedList;
 use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
-use pliron::r#type::Typed;
+use pliron::r#type::{TypeHandle, Typed};
 use pliron::{input_err, input_error};
 use rustc_public::CrateDef;
 use rustc_public::mir;
@@ -107,16 +110,15 @@ pub fn translate_terminator(
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
     block_map: &[Ptr<BasicBlock>],
+    rustc_mono_successors: &[usize],
     legaliser: &mut Legaliser,
 ) -> TranslationResult<Ptr<Operation>> {
-    // Use Debug representation of the span as location
-    let loc = Location::Named {
-        name: format!("{:?}", term.span),
-        child_loc: Box::new(Location::Unknown),
-    };
+    let loc = span_to_location(ctx, term.source_info.span);
 
     match &term.kind {
-        mir::TerminatorKind::Return => translate_return(ctx, value_map, block_ptr, prev_op, loc),
+        mir::TerminatorKind::Return => {
+            translate_return(ctx, body, value_map, block_ptr, prev_op, loc)
+        }
 
         mir::TerminatorKind::Goto { target } => {
             translate_goto(ctx, *target, block_ptr, prev_op, block_map, loc)
@@ -125,12 +127,12 @@ pub fn translate_terminator(
         mir::TerminatorKind::Assert {
             cond,
             expected,
-            msg: _,
+            msg,
             target,
             unwind,
         } => translate_assert(
-            ctx, body, cond, *expected, *target, unwind, block_ptr, prev_op, value_map, block_map,
-            loc,
+            ctx, body, cond, *expected, msg, *target, unwind, block_ptr, prev_op, value_map,
+            block_map, loc,
         ),
 
         mir::TerminatorKind::Call {
@@ -155,16 +157,29 @@ pub fn translate_terminator(
             legaliser,
         ),
 
-        mir::TerminatorKind::SwitchInt { discr, targets } => translate_switch(
-            ctx, body, discr, targets, block_ptr, prev_op, value_map, block_map, loc,
-        ),
+        mir::TerminatorKind::SwitchInt { discr, targets } => match rustc_mono_successors {
+            // rustc evaluated this switch for the concrete instance. Emit
+            // that exact edge instead of evaluating the converted public MIR
+            // a second time.
+            [target] => translate_goto(ctx, *target, block_ptr, prev_op, block_map, loc),
+            [] => input_err!(
+                loc,
+                TranslationErr::invalid_op(
+                    "rustc supplied no successor for a reachable SwitchInt".to_string()
+                )
+            ),
+            _ => translate_switch(
+                ctx, body, discr, targets, block_ptr, prev_op, value_map, block_map, loc,
+            ),
+        },
 
         mir::TerminatorKind::Drop {
             place,
             target,
             unwind,
         } => translate_drop(
-            ctx, body, place, *target, unwind, block_ptr, prev_op, block_map, loc,
+            ctx, body, place, *target, unwind, block_ptr, prev_op, value_map, block_map, legaliser,
+            loc,
         ),
 
         mir::TerminatorKind::Unreachable => {
@@ -212,6 +227,7 @@ pub fn translate_terminator(
 /// transfers control back to the caller with this value.
 fn translate_return(
     ctx: &mut Context,
+    body: &mir::Body,
     value_map: &mut ValueMap,
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
@@ -222,27 +238,53 @@ fn translate_return(
     // pass it as the `mir.return` operand. ZSTs (including `()` kernel
     // returns) have no slot, so we simply emit a bare `return`.
     let return_local = mir::Local::from(0usize);
+    let return_decl = &body.locals()[return_local];
+    let return_type = types::translate_type(ctx, &return_decl.ty)?;
+    let is_unit_return = {
+        use dialect_mir::types::MirTupleType;
+        let return_type_obj = return_type.deref(ctx);
+        if let Some(tuple_ty) = return_type_obj.downcast_ref::<MirTupleType>() {
+            tuple_ty.get_types().is_empty()
+        } else {
+            false
+        }
+    };
     let loaded = value_map.load_local(ctx, return_local, block_ptr, prev_op);
 
     let (operands, terminator_prev_op) = match loaded {
         Some((load_op, val)) => {
-            use dialect_mir::types::MirTupleType;
-            let val_type = val.get_type(ctx);
-            let val_type_obj = val_type.deref(ctx);
-            if let Some(tuple_ty) = val_type_obj.downcast_ref::<MirTupleType>() {
-                if tuple_ty.get_types().is_empty() {
-                    // Unit return: the load we just emitted is dead, but
-                    // harmless; leave it as prev_op so the return chains
-                    // after it.
-                    (vec![], Some(load_op))
-                } else {
-                    (vec![val], Some(load_op))
-                }
+            if is_unit_return {
+                // Unit return: the load we just emitted is dead, but harmless;
+                // leave it as prev_op so the return chains after it.
+                (vec![], Some(load_op))
             } else {
-                (vec![val], Some(load_op))
+                let (val, prev_op) =
+                    maybe_ptr_coerce(ctx, val, return_type, block_ptr, Some(load_op));
+                (vec![val], prev_op)
             }
         }
-        None => (vec![], prev_op),
+        None => {
+            let return_ty = types::translate_type(ctx, &body.locals()[return_local].ty)?;
+            let is_unit = return_ty
+                .deref(ctx)
+                .downcast_ref::<dialect_mir::types::MirTupleType>()
+                .is_some_and(|tuple| tuple.get_types().is_empty());
+            if types::is_zst_type(ctx, return_ty) && !is_unit {
+                // Non-unit ZST returns still need a MIR-level value so the
+                // `mir.return` verifier agrees with the function signature.
+                // LLVM lowering erases the value and emits a void return.
+                let undef = dialect_mir::ops::MirUndefOp::new(ctx, return_ty).get_operation();
+                undef.deref_mut(ctx).set_loc(loc.clone());
+                if let Some(prev) = prev_op {
+                    undef.insert_after(ctx, prev);
+                } else {
+                    undef.insert_at_front(block_ptr, ctx);
+                }
+                (vec![undef.deref(ctx).get_result(0)], Some(undef))
+            } else {
+                (vec![], prev_op)
+            }
+        }
     };
 
     let op = Operation::new(
@@ -314,12 +356,27 @@ fn translate_goto(
 /// If `expected == false`, the condition is negated before the assert:
 /// - `assert!(cond, expected=true)` → assert condition is true
 /// - `assert!(cond, expected=false)` → assert condition is false (negated)
+///
+/// # Unchecked indexing
+///
+/// When the body's unchecked-indexing policy is set (per-kernel
+/// `#[kernel(unchecked_indexing)]` marker or the whole-build
+/// `CUDA_OXIDE_UNCHECKED_INDEXING=1` switch), asserts whose message is
+/// `AssertMessage::BoundsCheck` are elided: control flows unconditionally to
+/// the success target and the condition is never materialized. This is legal
+/// because the success edge carries no block arguments. An out-of-bounds
+/// index then is undefined behavior, exactly like `get_unchecked`. Every
+/// other assert kind (overflow, division/remainder by zero, misaligned
+/// pointer, ...) keeps its compare-and-trap lowering, and panics that arrive
+/// as `core::panicking::*` calls (including range-indexing failures) are
+/// unaffected.
 #[allow(clippy::too_many_arguments)]
 fn translate_assert(
     ctx: &mut Context,
     body: &mir::Body,
     cond: &mir::Operand,
     expected: bool,
+    msg: &mir::AssertMessage,
     target: mir::BasicBlockIdx,
     unwind: &mir::UnwindAction,
     block_ptr: Ptr<BasicBlock>,
@@ -335,16 +392,34 @@ fn translate_assert(
     // panic occurs, the GPU thread traps.
     let _ = unwind;
 
-    // Translate the condition operand
+    // Opt-in bounds-check elision: replace the assert with an unconditional
+    // goto to the success target without translating the (now dead)
+    // condition. Only `BoundsCheck` messages qualify; see the doc comment.
+    if value_map.unchecked_indexing() && matches!(msg, mir::AssertMessage::BoundsCheck { .. }) {
+        return translate_goto(ctx, target, block_ptr, prev_op, block_map, loc);
+    }
+
+    // Translate the condition operand.
+    //
+    // MIR assert conditions are operands, not necessarily places. In
+    // particular, rustc can retain boolean constants for guaranteed-failure
+    // blocks and deliberate traps. The shared operand translator preserves the
+    // old Copy/Move path by delegating to `translate_place`.
+    //
+    // Keep RuntimeChecks fail-closed here. `translate_operand` currently lowers
+    // those session-dependent flags to `false` without access to rustc's
+    // `Session`; accepting them as assert conditions would silently change the
+    // requested assertion policy. They need separate session-policy plumbing.
     let (cond_value, mut last_inserted) = match cond {
-        mir::Operand::Copy(place) | mir::Operand::Move(place) => {
-            rvalue::translate_place(ctx, body, place, value_map, block_ptr, prev_op, loc.clone())?
+        mir::Operand::Copy(_) | mir::Operand::Move(_) | mir::Operand::Constant(_) => {
+            rvalue::translate_operand(ctx, body, cond, value_map, block_ptr, prev_op, loc.clone())?
         }
-        _ => {
+        mir::Operand::RuntimeChecks(_) => {
             return input_err!(
                 loc.clone(),
                 TranslationErr::unsupported(
-                    "Constant conditions in assert not yet implemented".to_string(),
+                    "RuntimeChecks conditions in assert require session-policy lowering"
+                        .to_string(),
                 )
             );
         }
@@ -356,7 +431,7 @@ fn translate_assert(
         let not_op = Operation::new(
             ctx,
             MirNotOp::get_concrete_op_info(),
-            vec![bool_type.to_ptr()],
+            vec![bool_type.to_handle()],
             vec![cond_value],
             vec![],
             0,
@@ -409,6 +484,33 @@ fn translate_assert(
     Ok(op)
 }
 
+/// Build the comparison constant for one `SwitchInt` arm, typed as the
+/// discriminant it is compared against.
+///
+/// Arm values arrive as `u128` bit patterns at the discriminant's width, so
+/// the constant is built at that width and a scrutinee wider than 64 bits
+/// keeps its whole value. Narrower widths truncate, which is what the
+/// discriminant's own type already did to the value.
+///
+/// Enum tags cannot reach here above 64 bits. `translate_adt_type` rejects a
+/// discriminant carrier wider than that when it builds the enum type, so the
+/// widths above 64 that arrive here belong to integer scrutinees.
+fn switch_arm_constant(
+    ctx: &mut Context,
+    val: u128,
+    width: usize,
+    signedness: Signedness,
+) -> pliron::builtin::attributes::IntegerAttr {
+    use pliron::utils::apint::APInt;
+    use std::num::NonZeroUsize;
+
+    let width_nz = NonZeroUsize::new(width).expect("integer discriminants have a non-zero width");
+    pliron::builtin::attributes::IntegerAttr::new(
+        IntegerType::get(ctx, width as u32, signedness),
+        APInt::from_u128(val, width_nz),
+    )
+}
+
 /// Translates a MIR `SwitchInt` terminator to conditional branches.
 ///
 /// Handles multi-way branches used for `match` expressions and enum dispatch:
@@ -440,9 +542,6 @@ fn translate_switch(
     block_map: &[Ptr<BasicBlock>],
     loc: Location,
 ) -> TranslationResult<Ptr<Operation>> {
-    use pliron::utils::apint::APInt;
-    use std::num::NonZeroUsize;
-
     // Translate discriminant
     let (discr_value, last_op) = match discr {
         mir::Operand::Copy(place) | mir::Operand::Move(place) => {
@@ -468,7 +567,7 @@ fn translate_switch(
         let discr_ty = discr_value.get_type(ctx);
         let bool_ty = types::get_bool_type(ctx);
 
-        let (condition, last_inserted_op) = if discr_ty == bool_ty.to_ptr() {
+        let (condition, last_inserted_op) = if discr_ty == bool_ty.to_handle() {
             // discr is already i1
             // For boolean switch: val=0 means "if false", val=1 means "if true"
             // switchInt(bool) -> [0: bb_false, otherwise: bb_true]
@@ -478,7 +577,7 @@ fn translate_switch(
                 let not_op = Operation::new(
                     ctx,
                     MirNotOp::get_concrete_op_info(),
-                    vec![bool_ty.to_ptr()],
+                    vec![bool_ty.to_handle()],
                     vec![discr_value],
                     vec![],
                     0,
@@ -505,13 +604,8 @@ fn translate_switch(
                     (64, Signedness::Unsigned) // Default to 64-bit unsigned if we can't determine
                 };
 
-            // Create constant for val with SAME type as discriminant
-            let width_nz = NonZeroUsize::new(width).unwrap();
-            let apint = APInt::from_u64(val as u64, width_nz);
-            let int_attr = pliron::builtin::attributes::IntegerAttr::new(
-                IntegerType::get(ctx, width as u32, signedness),
-                apint,
-            );
+            // Create constant for val with SAME type as discriminant.
+            let int_attr = switch_arm_constant(ctx, val, width, signedness);
 
             let const_op = Operation::new(
                 ctx,
@@ -538,7 +632,7 @@ fn translate_switch(
             let eq_op = Operation::new(
                 ctx,
                 MirEqOp::get_concrete_op_info(),
-                vec![bool_ty.to_ptr()],
+                vec![bool_ty.to_handle()],
                 vec![discr_value, const_val],
                 vec![],
                 0,
@@ -633,13 +727,8 @@ fn translate_switch(
             block_map[otherwise_idx]
         };
 
-        // Create constant for comparison with SAME type as discriminant
-        let width_nz = NonZeroUsize::new(width).unwrap();
-        let apint = APInt::from_u64(*val as u64, width_nz);
-        let int_attr = pliron::builtin::attributes::IntegerAttr::new(
-            IntegerType::get(ctx, width as u32, signedness),
-            apint,
-        );
+        // Create constant for comparison with SAME type as discriminant.
+        let int_attr = switch_arm_constant(ctx, *val, width, signedness);
 
         let const_op = Operation::new(
             ctx,
@@ -667,7 +756,7 @@ fn translate_switch(
         let cmp_op = Operation::new(
             ctx,
             MirEqOp::get_concrete_op_info(),
-            vec![bool_ty.to_ptr()],
+            vec![bool_ty.to_handle()],
             vec![discr_value, const_val],
             vec![],
             0,
@@ -716,25 +805,41 @@ fn translate_switch(
 /// Translates a MIR `Drop` terminator.
 ///
 /// rustc emits `TerminatorKind::Drop` only for places whose type has drop
-/// glue. cuda-oxide does not yet emit device-side `drop_in_place` calls,
-/// so any drop-glued type reaching codegen would have its destructor
-/// silently skipped. Rather than lower to a goto and produce a silent
-/// miscompile, we surface a hard error with the dropped place's type so
-/// the user can diagnose and restructure the kernel.
+/// glue. Two cases:
+///
+/// 1. **Provably no-op glue** (fast path): when the monomorphized drop glue
+///    does nothing observable (checked by [`drop_glue::drop_glue_is_noop`]),
+///    the terminator lowers to a plain branch to its target block.
+///    The common source pattern is `for x in arr` over a by-value
+///    array: the loop's `core::array::IntoIter<T, N>` has an
+///    `impl Drop`, but for element types without drop glue that
+///    destructor folds to nothing. This avoids the overhead of emitting
+///    a function call for drops that are statically proven to do nothing.
+///
+/// 2. **Effectful glue** (fallback): when the no-op proof fails, the type
+///    has a genuine destructor. We emit a device-side call to the
+///    monomorphized `drop_in_place::<T>` function, which the collector has
+///    already gathered and translated as a regular device function.
 ///
 /// Suppressing drop glue on a Copy-shaped value (e.g. wrapping in
 /// `core::mem::ManuallyDrop`) prevents the Drop terminator from being
-/// emitted in the first place and lets the kernel compile.
+/// emitted in the first place and lets the kernel compile without any
+/// drop overhead.
+///
+/// The unwind action is ignored: device code is panic=abort, so there is
+/// nothing that could unwind.
 #[allow(clippy::too_many_arguments)]
 fn translate_drop(
-    _ctx: &mut Context,
+    ctx: &mut Context,
     body: &mir::Body,
     place: &mir::Place,
-    _target: mir::BasicBlockIdx,
+    target: mir::BasicBlockIdx,
     _unwind: &mir::UnwindAction,
-    _block_ptr: Ptr<BasicBlock>,
-    _prev_op: Option<Ptr<Operation>>,
-    _block_map: &[Ptr<BasicBlock>],
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    legaliser: &mut Legaliser,
     loc: Location,
 ) -> TranslationResult<Ptr<Operation>> {
     let dropped_ty = place.ty(body.locals()).map_err(|e| {
@@ -745,21 +850,86 @@ fn translate_drop(
             ))
         )
     })?;
-    input_err!(
+
+    // Fast path: if the drop is provably a no-op, emit a plain branch.
+    if drop_glue::drop_glue_is_noop(dropped_ty) {
+        return translate_goto(ctx, target, block_ptr, prev_op, block_map, loc);
+    }
+
+    // Fallback: emit a device-side call to drop_in_place::<T>(ptr).
+    drop_glue::emit_drop_glue(
+        ctx, body, place, dropped_ty, target, block_ptr, prev_op, value_map, block_map, legaliser,
         loc,
-        TranslationErr::unsupported(format!(
-            "drop of `{:?}` is not supported on the device; cuda-oxide does \
-             not yet emit device-side `drop_in_place` calls. Restructure the \
-             kernel to use only `Copy` types, or wrap the value in \
-             `core::mem::ManuallyDrop` to suppress drop glue.",
-            dropped_ty.kind()
-        ))
     )
 }
 
 // ============================================================================
 // Call Translation (includes intrinsic dispatch)
 // ============================================================================
+
+/// True when `fn_def` is `core::ptr::drop_in_place` or `core::ptr::drop_glue`,
+/// the only functions whose monomorphizations resolve to rustc's drop-glue
+/// shims. Same crate + path-segment matching idiom as the callable-trait
+/// detection below.
+///
+/// `drop_glue` (`#[lang = "drop_glue"]`) exists since nightly-2026-08-28:
+/// `drop_in_place` is now an ordinary `core` function whose body forwards to
+/// the compiler-replaced `drop_glue` shim, so a translated `drop_in_place`
+/// body contains a plain Call to `drop_glue::<T>` that needs the same
+/// noop-elision as direct `drop_in_place` calls.
+fn is_drop_in_place_callee(fn_def: &rustc_public::ty::FnDef) -> bool {
+    if fn_def.krate().name.as_str() != "core" {
+        return false;
+    }
+    let method_name = fn_def.def_id().name();
+    let method = method_name.as_str().rsplit("::").next().unwrap_or("");
+    let Some(parent_def) = fn_def.def_id().parent() else {
+        return false;
+    };
+    let parent_name = parent_def.name();
+    let parent = parent_name.as_str().rsplit("::").next().unwrap_or("");
+    (method == "drop_in_place" || method == "drop_glue") && parent == "ptr"
+}
+
+/// Emit a branch to `target` as the only effect of a call we are eliding:
+/// the callee does nothing observable and has no device definition (a UB
+/// precondition check, or provably no-op drop glue). `emit_goto` needs a
+/// prior op to anchor after, so if the block has none yet we plant a dead
+/// `false` constant first.
+fn emit_elided_call_goto(
+    ctx: &mut Context,
+    target_idx: usize,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> Ptr<Operation> {
+    let anchor = if let Some(p) = prev_op {
+        p
+    } else {
+        use pliron::builtin::attributes::IntegerAttr;
+        use pliron::utils::apint::APInt;
+        use std::num::NonZeroUsize;
+
+        let bool_ty = IntegerType::get(ctx, 1, Signedness::Signless);
+        let dummy = Operation::new(
+            ctx,
+            MirConstantOp::get_concrete_op_info(),
+            vec![bool_ty.into()],
+            vec![],
+            vec![],
+            0,
+        );
+        dummy.deref_mut(ctx).set_loc(loc.clone());
+        let const_op = MirConstantOp::new(dummy);
+        let false_val = APInt::from_u64(0, NonZeroUsize::new(1).unwrap());
+        const_op.set_attr_value(ctx, IntegerAttr::new(bool_ty, false_val));
+        let dummy = const_op.get_operation();
+        dummy.insert_at_front(block_ptr, ctx);
+        dummy
+    };
+    helpers::emit_goto(ctx, target_idx, anchor, block_map, loc)
+}
 
 /// Translates a MIR `Call` terminator to Pliron IR operations.
 ///
@@ -811,146 +981,175 @@ fn translate_call(
     let target_usize = target.map(|t| t);
 
     // Extract function info
-    let (pattern_name, call_name, substs_str, func_ret_ty) = extract_func_info(func);
+    let (pattern_name, call_name, substs_args, type_substs) = extract_func_info(func, &loc)?;
+    let loc = call_debug_location(pattern_name.as_deref(), loc);
 
-    // Helper to check if substitutions contain a type
-    let substs_contains =
-        |pattern: &str| -> bool { substs_str.as_ref().is_some_and(|s| s.contains(pattern)) };
+    // Is the trait-method Self type SharedArray? Shared with
+    // `values::classify_call` so intrinsic dispatch and destination-slot
+    // classification can't drift.
+    let on_shared_array = substs_args.as_ref().is_some_and(self_ty_is_shared_array);
 
     // Skip precondition_check calls - these are UB check assertions that are
     // dead code because we return false for RuntimeChecks(UbChecks).
     // The MIR still contains these calls, but they're in dead branches.
-    if let Some(ref name) = pattern_name
-        && name.contains("precondition_check")
+    if let Some(target_idx) = target_usize
+        && let mir::Operand::Constant(const_op) = func
+        && let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(fn_def, _)) =
+            const_op.const_.ty().kind()
+        && is_std_precondition_check(&fn_def)
     {
         // Just emit a goto to the target block, skipping the call entirely
-        if let Some(target_idx) = target_usize {
-            let actual_prev_op = if let Some(p) = prev_op {
-                p
-            } else {
-                // Create a dummy i1 constant (false) as a placeholder operation
-                use pliron::builtin::attributes::IntegerAttr;
-                use pliron::utils::apint::APInt;
-                use std::num::NonZeroUsize;
+        return Ok(emit_elided_call_goto(
+            ctx, target_idx, block_ptr, prev_op, block_map, loc,
+        ));
+    }
 
-                let bool_ty = IntegerType::get(ctx, 1, Signedness::Signless);
-                let dummy = Operation::new(
-                    ctx,
-                    MirConstantOp::get_concrete_op_info(),
-                    vec![bool_ty.into()],
-                    vec![],
-                    vec![],
-                    0,
-                );
-                dummy.deref_mut(ctx).set_loc(loc.clone());
-                let const_op = MirConstantOp::new(dummy);
-                let false_val = APInt::from_u64(0, NonZeroUsize::new(1).unwrap());
-                const_op.set_attr_value(ctx, IntegerAttr::new(bool_ty, false_val));
-                let dummy = const_op.get_operation();
-                dummy.insert_at_front(block_ptr, ctx);
-                dummy
-            };
-            return Ok(helpers::emit_goto(
+    // Elide a call to provably no-op drop glue. An explicit
+    // `ptr::drop_in_place::<T>` call (e.g. reached from inside another type's
+    // `Drop::drop`, or from a libcore wrapper) resolves either to rustc's
+    // empty shim for a `T` with no drop glue (`InstanceKind::DropGlue(_,
+    // None)`) or to a shim body the shared no-op proof can discharge. The
+    // collector refuses to collect exactly that set (`process_call_operand`
+    // skips DropGlue callees via the same predicate), so emitting the call
+    // would dangle as `Symbol ...drop_in_place... not found` at verification
+    // time. The glue does nothing, so drop the call and branch straight to
+    // the target -- the same elision the `Drop` terminator path performs via
+    // `drop_glue_is_noop`, consulting the same shared predicate
+    // (`drop_instance_is_noop`, whose fast path covers the empty shim) so
+    // collection and emission stay in lockstep.
+    if let Some(target_idx) = target_usize
+        && let mir::Operand::Constant(const_op) = func
+        && let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(
+            fn_def,
+            ref substs,
+        )) = const_op.const_.ty().kind()
+        && is_drop_in_place_callee(&fn_def)
+        && let Ok(instance) = rustc_public::mir::mono::Instance::resolve(fn_def, substs)
+        && drop_glue::drop_instance_is_noop(&instance)
+    {
+        return Ok(emit_elided_call_goto(
+            ctx, target_idx, block_ptr, prev_op, block_map, loc,
+        ));
+    }
+
+    // Identify the actual core callable-trait methods. Matching text in an
+    // arbitrary function name is not sufficient: a user function named, for
+    // example, `call_once_helper` must remain an ordinary call.
+    if let Some(call_info) = callable_trait_call_info(func)
+        && !args.is_empty()
+    {
+        if receiver_is_closure(&args[0], body) {
+            return translate_closure_call(
                 ctx,
-                target_idx,
-                actual_prev_op,
+                body,
+                &call_name,
+                call_info.resolved_is_shim,
+                args,
+                destination,
+                &target_usize,
+                block_ptr,
+                prev_op,
+                value_map,
                 block_map,
                 loc,
-            ));
+                legaliser,
+            );
+        }
+        if let Some(function_item) = extract_function_item_target(&args[0], body, &loc)? {
+            return translate_function_item_call(
+                ctx,
+                body,
+                &function_item,
+                args,
+                destination,
+                &target_usize,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+                legaliser,
+            );
         }
     }
 
-    // Handle closure trait method calls (FnOnce::call_once, FnMut::call_mut, Fn::call)
-    // These calls pass arguments as a tuple, but the closure body expects unpacked args.
-    // We need to unpack the tuple before calling the closure.
-    //
-    // MIR shows: <{closure} as FnMut<(u32,)>>::call_mut(self_ref, tuple_args)
-    // But the closure body expects: fn(self_ref, unpacked_arg1, unpacked_arg2, ...)
-    if let Some(ref name) = pattern_name
-        && (name.contains("call_once") || name.contains("call_mut") || name.ends_with("::call"))
-        && substs_contains("Closure")
-    {
-        return translate_closure_call(
-            ctx,
-            body,
-            &call_name,
-            &func_ret_ty,
-            args,
-            destination,
-            &target_usize,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-            legaliser,
-        );
-    }
-
-    // Handle prof_trigger specially to extract const generic N
-    if let Some(ref name) = pattern_name
-        && name == "cuda_device::debug::prof_trigger"
-    {
-        // Extract the const generic N from the function type
-        if let mir::Operand::Constant(const_op) = func
-            && let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(_, substs)) =
-                const_op.const_.ty().kind()
-        {
-            // The const generic N is the first generic argument
-            if let Some(rustc_public::ty::GenericArgKind::Const(c)) = substs.0.first() {
-                use rustc_public::ty::TyConstKind;
-
-                let event_id = match c.kind() {
-                    TyConstKind::Value(_, alloc) => {
-                        // Read the allocation bytes (little-endian u32)
-                        alloc.read_uint().unwrap_or(0) as u32
-                    }
-                    _ => {
-                        // Try eval_target_usize as fallback
-                        c.eval_target_usize().unwrap_or(0) as u32
-                    }
-                };
-                return intrinsics::debug::emit_prof_trigger(
-                    ctx,
-                    event_id,
-                    &target_usize,
-                    block_ptr,
-                    prev_op,
-                    block_map,
-                    loc,
-                );
-            }
+    // Per-loop unroll marker from `#[unroll]` / `#[unroll(N)]`. The enclosing
+    // `#[kernel]` or `#[device]` macro injects this call at the start of the loop
+    // body, so we plant a `mir.unroll_hint` op right here, inside that loop
+    // body. The loop-unroll pass later maps the hint back to its enclosing loop
+    // (via LoopInfo) and consumes it, so it never reaches lowering. The factor
+    // is the call's const generic (`0` = full unroll). Then branch to the
+    // target as usual.
+    // Match both the full path (`cuda_device::thread::__unroll_config`) and the
+    // re-exported short path (`cuda_device::__unroll_config`), mirroring the
+    // robust suffix match in `body::detect_unroll_config`.
+    if is_cuda_device_const_marker(func, "__unroll_config") {
+        let Some(factor) = extract_unroll_factor(func) else {
+            return input_err!(
+                loc,
+                TranslationErr::invalid_op(
+                    "could not read the const-generic factor from an unroll marker",
+                )
+            );
+        };
+        if factor == 1 || factor > 1024 {
+            return input_err!(
+                loc,
+                TranslationErr::invalid_op(format!(
+                    "partial unroll factor must be in 2..=1024, or 0 for full unrolling; got {factor}"
+                ))
+            );
         }
+        let Some(target) = target_usize else {
+            return input_err!(
+                loc,
+                TranslationErr::invalid_op("an unroll marker call has no return target")
+            );
+        };
+        let hint = MirUnrollHintOp::new(ctx, factor).get_operation();
+        hint.deref_mut(ctx).set_loc(loc.clone());
+        match prev_op {
+            Some(prev) => hint.insert_after(ctx, prev),
+            None => hint.insert_at_front(block_ptr, ctx),
+        }
+        return Ok(helpers::emit_goto(ctx, target, hint, block_map, loc));
     }
 
-    // Handle DynamicSharedArray specially to extract the ALIGN const generic
+    // Handle DynamicSharedArray specially to extract the ALIGN const generic.
+    // The crate anchor tightens the name-substring gate: a user fn merely
+    // named like it falls through to ordinary call handling. Kept in
+    // lockstep with the classifier in `values::classify_call`.
     if let Some(ref name) = pattern_name
         && name.contains("DynamicSharedArray")
         && (name.contains("::get") || name.contains("::offset"))
+        && is_cuda_device_fn(func)
     {
-        // Extract the ALIGN const generic from the function type
-        // DynamicSharedArray<T, ALIGN> has T as first generic, ALIGN as second
-        let alignment = if let mir::Operand::Constant(const_op) = func {
-            if let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(_, substs)) =
-                const_op.const_.ty().kind()
-            {
-                // The ALIGN const generic is the second generic argument (index 1)
-                // First is T (type), second is ALIGN (const)
-                if let Some(rustc_public::ty::GenericArgKind::Const(c)) = substs.0.get(1) {
-                    use rustc_public::ty::TyConstKind;
-                    match c.kind() {
-                        TyConstKind::Value(_, alloc) => alloc.read_uint().unwrap_or(16) as u64,
-                        _ => c.eval_target_usize().unwrap_or(16),
-                    }
-                } else {
-                    16 // Default alignment (matches nvcc)
-                }
-            } else {
-                16
-            }
-        } else {
-            16
+        // DynamicSharedArray substs arrive in declaration order, with the
+        // ALIGN default already materialized by rustc:
+        //
+        //   DynamicSharedArray<T, ALIGN = 16>
+        //     [0] T      type
+        //     [1] ALIGN  const usize
+        //
+        // A read failure here must be an error, never a guessed 16: a
+        // silently 16-aligned extern smem symbol corrupts TMA at runtime.
+        let Some(substs) = substs_args.as_ref() else {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(
+                    "DynamicSharedArray call carries no generic substitutions"
+                )
+            );
         };
+        let Some(rustc_public::ty::GenericArgKind::Const(c)) = substs.0.get(1) else {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(
+                    "DynamicSharedArray substs missing the ALIGN const generic at position 1"
+                )
+            );
+        };
+        let alignment: u64 = eval_usize_const(c, "DynamicSharedArray ALIGN", Some(&loc))?;
 
         if name.contains("::get") {
             // Both get() and get_raw() use the same handler with offset 0
@@ -1008,11 +1207,53 @@ fn translate_call(
         );
     }
 
+    // `assert_inhabited::<T>()` is a compile-time validity check that rustc
+    // plants in `MaybeUninit::assume_init_read`, which the `for x in arr`
+    // loop machinery calls for every yielded element (issue #138). The
+    // intrinsic panics only when `T` has no possible values at all (an
+    // "uninhabited" type such as `core::convert::Infallible`); for any
+    // ordinary type it compiles to nothing. We decide which case applies
+    // from the monomorphized type's layout: uninhabited types are exactly
+    // those whose layout has `VariantsShape::Empty`. Inhabited types lower
+    // to a unit no-op; uninhabited ones lower to a trap.
+    // If the generic argument or its layout cannot be read, fall through
+    // to the loud "not yet supported" rejection below.
+    if let Some(ref name) = pattern_name
+        && (name == "core::intrinsics::assert_inhabited"
+            || name == "std::intrinsics::assert_inhabited")
+        && let mir::Operand::Constant(const_op) = func
+        && let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(_, substs)) =
+            const_op.const_.ty().kind()
+        && let Some(rustc_public::ty::GenericArgKind::Type(checked_ty)) = substs.0.first()
+        && let Ok(layout) = checked_ty.layout()
+    {
+        let uninhabited = matches!(
+            layout.shape().variants,
+            rustc_public::abi::VariantsShape::Empty
+        );
+        if uninhabited {
+            return Ok(emit_trap_unreachable_after(ctx, block_ptr, prev_op, loc));
+        }
+        return helpers::emit_unit_noop_intrinsic(
+            ctx,
+            body,
+            destination,
+            &target_usize,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+            name,
+        );
+    }
+
     // Try to dispatch as intrinsic
     if let Some(ref name) = pattern_name
         && let Some(result) = try_dispatch_intrinsic(
             ctx,
             body,
+            func,
             name,
             args,
             destination,
@@ -1022,7 +1263,8 @@ fn translate_call(
             value_map,
             block_map,
             loc.clone(),
-            &substs_contains,
+            on_shared_array,
+            &type_substs,
         )?
     {
         return Ok(result);
@@ -1030,43 +1272,95 @@ fn translate_call(
 
     // Handle diverging calls (calls that never return, like unwrap_failed, panic, etc.)
     // These have no target block because the function never returns.
-    // In GPU code, we emit an unreachable terminator since panics can't actually execute.
+    //
+    // The callee is dropped and replaced by an immediate trap. That applies
+    // to every `-> !` callee reaching this point, including a user
+    // `#[device]` fn that legitimately diverges (e.g. `loop {}`); full Rust
+    // fidelity would emit the call for resolvable callees the way
+    // `translate_function_item_call` does. Dropping the call is a
+    // pre-existing semantic: the trap only makes it safe, where the bare
+    // `unreachable` previously emitted here was UB that let `opt` delete
+    // the whole panic path.
+    //
+    // Panic entry points additionally never get here with any statements
+    // translated ahead of them: `block::translate_block` recognizes the same
+    // shape via [`is_dropped_panic_call`] and emits the trap directly.
     if target_usize.is_none() {
-        // This is a diverging call (returns !) - emit unreachable
+        // This is a diverging call (returns !) - emit trap + unreachable
         // Examples: unwrap_failed(), panic!(), abort()
-        let op = Operation::new(
-            ctx,
-            dialect_mir::ops::MirUnreachableOp::get_concrete_op_info(),
-            vec![],
-            vec![],
-            vec![],
-            0,
+        return Ok(emit_trap_unreachable_after(ctx, block_ptr, prev_op, loc));
+    }
+
+    // A call to a rustc intrinsic that no dispatch arm above recognized can
+    // never be emitted as a regular function call: rustc resolves intrinsics
+    // to `InstanceKind::Intrinsic`, the collector skips those by design, so
+    // no definition for the symbol will ever exist in the module. Emitting
+    // the call anyway would only fail much later, as a confusing
+    // "Symbol ... not found" verifier error on the LLVM dialect module.
+    // Fail here instead, with the intrinsic's name and source location, so
+    // each gap surfaces as an actionable per-site diagnostic (issue #137).
+    if let Some(ref name) = pattern_name
+        && (name.starts_with("core::intrinsics::") || name.starts_with("std::intrinsics::"))
+    {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "rustc intrinsic `{name}` is not yet supported on the device"
+            ))
         );
-        op.deref_mut(ctx).set_loc(loc);
-        if let Some(prev) = prev_op {
-            op.insert_after(ctx, prev);
-        } else {
-            op.insert_at_front(block_ptr, ctx);
-        }
-        return Ok(op);
+    }
+
+    // The collector skips the entire `libm` crate: every libm call must be
+    // intercepted by the float-math dispatch above and rerouted to a
+    // libdevice intrinsic, so no definition for a libm symbol ever exists in
+    // the module. A libm function the dispatch does not recognize would only
+    // fail much later, as a bare "Symbol libm__cbrtf not found" verifier
+    // error on the LLVM dialect module. Fail here instead, with the
+    // function's name and source location.
+    if let Some(ref name) = pattern_name
+        && intrinsics::float_math::is_libm_path(name)
+    {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "libm function `{name}` is not yet mapped to a libdevice intrinsic; \
+                 add it to `from_libm_path` in the mir-importer float-math dispatch"
+            ))
+        );
     }
 
     // Not an intrinsic - emit regular function call
     let raw_name = call_name.unwrap_or_else(|| "unknown_function".to_string());
     let legal_name = legaliser.legalise(&raw_name);
-    let return_type = if let Some(ret_ty) = func_ret_ty {
-        types::translate_type(ctx, &ret_ty)?
-    } else {
-        dialect_mir::types::MirTupleType::get(ctx, vec![]).into()
-    };
+
+    // Foreign items have no `mir.func` body to provide an independent symbol
+    // signature. Preserve the exact resolved rustc declaration on the call so
+    // final module verification can still reject pointer-kind laundering at
+    // this ABI boundary. This must be derived from `func`, not reconstructed
+    // from the already-created call operands or destination.
+    let external_callee_type = translate_foreign_callee_type(ctx, func)?;
+
+    // Type the call result from the caller's destination place, not from the
+    // callee's declared signature. The declared signature of a trait method
+    // is written against the trait, so its return type can be an unresolved
+    // associated-type projection such as `<&Foo as Mul>::Output` (issue #133),
+    // which the type translator cannot turn into a concrete layout. The
+    // destination local in the caller's monomorphized MIR already has that
+    // projection resolved (`Foo`), and it is by construction the exact type
+    // the call result is stored into, so the `mir.call` result type and the
+    // destination slot always agree. The callee `mir.func` return type is
+    // independently derived from the callee body's return place, which is
+    // normalized the same way, so caller and callee stay consistent.
+    let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
 
     helpers::emit_function_call(
         ctx,
         body,
-        &legal_name,
+        legal_name.as_ref(),
         args,
         destination,
         return_type,
+        external_callee_type,
         &target_usize,
         block_ptr,
         prev_op,
@@ -1074,6 +1368,281 @@ fn translate_call(
         block_map,
         loc,
     )
+}
+
+/// Translate the exact signature of a resolved Rust foreign item.
+///
+/// Ordinary Rust callees are independently typed by their `mir.func` op and
+/// therefore return `None`. Foreign declarations have no MIR body, so this
+/// `FunctionType` is attached to the call with `AbiBoundary` authority and is
+/// checked again by the final dialect verifier.
+fn translate_foreign_callee_type(
+    ctx: &mut Context,
+    func: &mir::Operand,
+) -> TranslationResult<Option<TypeHandle>> {
+    use dialect_mir::types::MirTupleType;
+    use rustc_public::mir::mono::Instance;
+    use rustc_public::ty::{RigidTy, TyKind};
+
+    let mir::Operand::Constant(constant) = func else {
+        return Ok(None);
+    };
+    if *constant.const_.kind() != ConstantKind::ZeroSized {
+        return Ok(None);
+    }
+    let TyKind::RigidTy(RigidTy::FnDef(fn_def, substs)) = constant.const_.ty().kind() else {
+        return Ok(None);
+    };
+    let Some(instance) = Instance::resolve(fn_def, &substs).ok() else {
+        return Ok(None);
+    };
+    if !instance.is_foreign_item() {
+        return Ok(None);
+    }
+
+    let fn_ty = instance.ty();
+    let Some(signature) = fn_ty.kind().fn_sig() else {
+        return input_err!(
+            pliron::location::Location::Unknown,
+            TranslationErr::unsupported(format!(
+                "resolved foreign item `{}` has no function signature",
+                instance.name()
+            ))
+        );
+    };
+    let signature = signature.skip_binder();
+    ensure_foreign_callee_is_not_variadic(&instance.name().to_string(), signature.c_variadic)?;
+    let mut arguments = Vec::with_capacity(signature.inputs().len());
+    for argument in signature.inputs() {
+        arguments.push(types::translate_type(ctx, argument)?);
+    }
+
+    let output = signature.output();
+    let output = types::translate_type(ctx, &output)?;
+    let is_unit = output
+        .deref(ctx)
+        .downcast_ref::<MirTupleType>()
+        .is_some_and(|tuple| tuple.get_types().is_empty());
+    let results = if is_unit { vec![] } else { vec![output] };
+
+    Ok(Some(FunctionType::get(ctx, arguments, results).into()))
+}
+
+/// The builtin source `FunctionType` and MIR call operation are fixed-arity.
+/// Refuse a C-variadic foreign declaration instead of recording only its fixed
+/// prefix and incorrectly presenting that incomplete type as the exact ABI.
+fn ensure_foreign_callee_is_not_variadic(
+    callee_name: &str,
+    c_variadic: bool,
+) -> TranslationResult<()> {
+    if c_variadic {
+        return input_err!(
+            pliron::location::Location::Unknown,
+            TranslationErr::unsupported(format!(
+                "resolved foreign item `{callee_name}` is C-variadic; variadic foreign calls are not supported"
+            ))
+        );
+    }
+    Ok(())
+}
+
+// stable-MIR reports the function's canonical definition path rather than the
+// `cuda_device::thread::__internal` re-export spelling emitted by the macro,
+// but accept both spellings like the metadata markers below so a toolchain
+// bump changing visible-path selection cannot silently drop the match.
+const KERNEL_SCOPE_CONSTRUCTORS: &[&str] = &[
+    "cuda_device::__internal::make_kernel_scope",
+    "cuda_device::thread::__internal::make_kernel_scope",
+];
+
+// These start-of-kernel calls are compiler metadata, not source statements.
+// They are removed during import, but the replacement control-flow edge must
+// also stay off the attribute line which caused the macro to inject them.
+const KERNEL_METADATA_MARKERS: &[&str] = &[
+    "cuda_device::__launch_bounds_config",
+    "cuda_device::thread::__launch_bounds_config",
+    "cuda_device::__launch_contract_config",
+    "cuda_device::thread::__launch_contract_config",
+    "cuda_device::__launch_contract_block_config",
+    "cuda_device::thread::__launch_contract_block_config",
+    "cuda_device::__unchecked_indexing_config",
+    "cuda_device::thread::__unchecked_indexing_config",
+    "cuda_device::cluster::__cluster_config",
+    "cuda_device::shared::__dynamic_shared_alignment",
+];
+
+/// Keep the macro-injected launch-context constructor out of user line tables.
+///
+/// Its Rust span intentionally stays at the proc-macro invocation so any
+/// type-checker or borrow-checker diagnostic points into the user's item. The
+/// call itself is compiler-generated setup, though, and must not make a
+/// function breakpoint stop on `#[kernel]` (or whichever adjacent attribute
+/// happened to invoke the macro). Separating the debug location here lets the
+/// diagnostic span and runtime line table serve those different purposes.
+fn call_debug_location(pattern_name: Option<&str>, loc: Location) -> Location {
+    if pattern_name.is_some_and(|name| {
+        KERNEL_SCOPE_CONSTRUCTORS.contains(&name) || KERNEL_METADATA_MARKERS.contains(&name)
+    }) {
+        llvm_export::artificial_debug_location()
+    } else {
+        loc
+    }
+}
+
+/// Handle `FnOnce::call_once`, `FnMut::call_mut`, or `Fn::call` when the
+/// receiver is a function item.
+///
+/// Rust-call ABI passes `(self, tuple_args)` to the trait shim, but the
+/// function item's real body expects only the tuple elements as ordinary
+/// arguments. Lowering the shim as an ordinary call leaves a dangling
+/// `<fn item as FnOnce>::call_once` symbol because no MIR body is collected
+/// for that shim.
+#[allow(clippy::too_many_arguments)]
+fn translate_function_item_call(
+    ctx: &mut Context,
+    body: &mir::Body,
+    function_item: &FunctionItemTarget,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+    legaliser: &mut Legaliser,
+) -> TranslationResult<Ptr<Operation>> {
+    use dialect_mir::ops::{MirCallOp, MirExtractFieldOp};
+    use pliron::builtin::attributes::StringAttr;
+    use pliron::identifier::Identifier;
+
+    if function_item.requires_direct_dispatch {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "calling `{}` through Fn/FnMut/FnOnce is not yet supported because that target requires intrinsic or external dispatch; wrap it in a local `#[device]` function and pass the wrapper instead",
+                function_item.name
+            ))
+        );
+    }
+
+    let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
+    let callee = legaliser.legalise(&function_item.name).to_string();
+
+    let mut unpacked_args = Vec::new();
+    let mut last_op = prev_op;
+
+    if let Some(tuple_arg) = args.get(1) {
+        let (tuple_value, tuple_last_op) = rvalue::translate_operand(
+            ctx,
+            body,
+            tuple_arg,
+            value_map,
+            block_ptr,
+            last_op,
+            loc.clone(),
+        )?;
+        last_op = tuple_last_op;
+
+        let tuple_ty = tuple_value.get_type(ctx);
+        let element_types: Option<Vec<_>> = {
+            let tuple_ty_obj = tuple_ty.deref(ctx);
+            tuple_ty_obj
+                .downcast_ref::<dialect_mir::types::MirTupleType>()
+                .map(|mir_tuple_ty| mir_tuple_ty.get_types().to_vec())
+        };
+
+        if let Some(element_types) = element_types {
+            for (i, elem_ty) in element_types.iter().enumerate() {
+                let extract_op = Operation::new(
+                    ctx,
+                    MirExtractFieldOp::get_concrete_op_info(),
+                    vec![*elem_ty],
+                    vec![tuple_value],
+                    vec![],
+                    0,
+                );
+                extract_op.deref_mut(ctx).set_loc(loc.clone());
+
+                let mir_extract = MirExtractFieldOp::new(extract_op);
+                mir_extract.set_attr_index(ctx, dialect_mir::attributes::FieldIndexAttr(i as u32));
+
+                if let Some(prev) = last_op {
+                    extract_op.insert_after(ctx, prev);
+                } else {
+                    extract_op.insert_at_front(block_ptr, ctx);
+                }
+                last_op = Some(extract_op);
+                unpacked_args.push(extract_op.deref(ctx).get_result(0));
+            }
+        } else {
+            unpacked_args.push(tuple_value);
+        }
+    }
+
+    let prepared_destination = if target.is_some() {
+        let (prepared, prepared_last_op) = helpers::prepare_destination_write(
+            ctx,
+            body,
+            destination,
+            value_map,
+            block_ptr,
+            last_op,
+            loc.clone(),
+        )?;
+        last_op = prepared_last_op;
+        Some(prepared)
+    } else {
+        None
+    };
+
+    let call_op = Operation::new(
+        ctx,
+        MirCallOp::get_concrete_op_info(),
+        vec![return_type],
+        unpacked_args,
+        vec![],
+        0,
+    );
+    call_op.deref_mut(ctx).set_loc(loc.clone());
+
+    call_op.deref_mut(ctx).attributes.set(
+        Identifier::try_from("callee").unwrap(),
+        StringAttr::new(callee),
+    );
+
+    if let Some(prev) = last_op {
+        call_op.insert_after(ctx, prev);
+    } else {
+        call_op.insert_at_front(block_ptr, ctx);
+    }
+
+    if target.is_none() {
+        return Ok(emit_unreachable_after(ctx, block_ptr, Some(call_op), loc));
+    }
+
+    let result_value = call_op.deref(ctx).get_result(0);
+    let last_inserted = helpers::finish_destination_write(
+        ctx,
+        prepared_destination.expect("returning call prepared its destination"),
+        result_value,
+        value_map,
+        block_ptr,
+        call_op,
+        loc.clone(),
+    )?;
+
+    if let Some(target_idx) = target {
+        Ok(helpers::emit_goto(
+            ctx,
+            *target_idx,
+            last_inserted,
+            block_map,
+            loc,
+        ))
+    } else {
+        Ok(call_op)
+    }
 }
 
 /// Handle closure trait method calls (FnOnce::call_once, FnMut::call_mut, Fn::call).
@@ -1086,9 +1655,12 @@ fn translate_call(
 ///
 /// ## Important: Closure Body Resolution
 ///
-/// In unified compilation with `std`, `Instance::resolve` for `<Closure as FnOnce>::call_once`
-/// returns a trait method **shim**, not the closure body directly. We must extract the closure's
-/// DefId from `args[0]`'s type and resolve that to get the actual closure body's mangled name.
+/// When an `Fn` or `FnMut` closure is requested through `FnOnce`,
+/// `Instance::resolve` returns a `ClosureOnce` adapter shim rather than the
+/// closure body. Other closure calls may resolve directly to the body. In
+/// either case, extract the closure DefId from `args[0]` so the emitted device
+/// call targets the body; `resolved_is_shim` separately controls receiver
+/// adaptation.
 ///
 /// See `device_closures/README.md` for detailed documentation.
 #[allow(clippy::too_many_arguments)]
@@ -1096,7 +1668,7 @@ fn translate_closure_call(
     ctx: &mut Context,
     body: &mir::Body,
     call_name: &Option<String>,
-    func_ret_ty: &Option<rustc_public::ty::Ty>,
+    resolved_is_shim: bool,
     args: &[mir::Operand],
     destination: &mir::Place,
     target: &Option<usize>,
@@ -1108,27 +1680,32 @@ fn translate_closure_call(
     legaliser: &mut Legaliser,
 ) -> TranslationResult<Ptr<Operation>> {
     use dialect_mir::ops::{MirCallOp, MirExtractFieldOp};
-    use pliron::builtin::attributes::{IntegerAttr, StringAttr};
+    use pliron::builtin::attributes::StringAttr;
     use pliron::identifier::Identifier;
     use pliron::r#type::Typed;
-    use pliron::utils::apint::APInt;
-    use std::num::NonZeroUsize;
 
-    let return_type = if let Some(ret_ty) = func_ret_ty {
-        types::translate_type(ctx, ret_ty)?
-    } else {
-        dialect_mir::types::MirTupleType::get(ctx, vec![]).into()
+    // Same reasoning as the regular-call path: the trait-level signature of
+    // `FnOnce::call_once` types its result as the projection
+    // `<{closure} as FnOnce<Args>>::Output`. The caller's destination local
+    // carries the already-resolved concrete type, so use that.
+    let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
+
+    // Resolve the body independently from the callable-trait method. Besides
+    // selecting the body rather than a ClosureOnce adapter, this gives us the
+    // body's actual first parameter. That parameter is authoritative for the
+    // receiver kind: `&Closure` is SharedRef, `&mut Closure` is UniqueRef, and
+    // an FnOnce body receives the closure by value.
+    let Some(closure_body) = extract_closure_body_target(&args[0], body) else {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "failed to resolve the closure body and receiver ABI for `{}`",
+                call_name.as_deref().unwrap_or("unknown closure")
+            ))
+        );
     };
-
-    // Extract the closure body's name from the closure type in args[0].
-    // This is critical for unified compilation where Instance::resolve returns
-    // a trait shim instead of the closure body directly.
-    let closure_body_name = extract_closure_body_name(&args[0], body);
-
-    let raw_callee = closure_body_name
-        .or_else(|| call_name.as_ref().map(|s| s.to_string()))
-        .unwrap_or_else(|| "unknown_closure".to_string());
-    let callee = legaliser.legalise(&raw_callee).to_string();
+    let callee = legaliser.legalise(&closure_body.name).to_string();
+    let expected_receiver_type = types::translate_type(ctx, &closure_body.receiver_ty)?;
 
     // Translate self argument (args[0])
     let (self_value, mut last_op) = rvalue::translate_operand(
@@ -1153,65 +1730,102 @@ fn translate_closure_call(
     )?;
     last_op = tuple_last_op;
 
-    // Determine if this is call_once (by value) vs call_mut/call (by reference).
-    //
-    // In `std` mode, rustc generates `FnOnce::call_once(self, args)` which passes
-    // the closure BY VALUE. But the closure body expects `&self` (a reference).
-    //
-    // In `no_std` mode, rustc generates `FnMut::call_mut(&mut self, args)` which
-    // already passes a reference.
-    //
-    // When we have call_once, we need to create a reference to the closure value
-    // before calling the closure body.
-    //
-    // We check the ORIGINAL call_name (the trait method), not the resolved callee
-    // (which is the closure body name).
-    let is_call_once = call_name
-        .as_ref()
-        .map(|n| n.contains("call_once"))
-        .unwrap_or(false);
-
-    let self_arg = if is_call_once {
-        // For call_once: self is passed by value, but closure body expects reference.
-        // Create a MirRefOp to take a reference to the closure value.
-        let self_ty = self_value.get_type(ctx);
-        let ptr_ty = dialect_mir::types::MirPtrType::get(ctx, self_ty, true, 0);
-
-        let ref_op = Operation::new(
-            ctx,
-            dialect_mir::ops::MirRefOp::get_concrete_op_info(),
-            vec![ptr_ty.into()],
-            vec![self_value],
-            vec![],
-            0,
-        );
-        ref_op.deref_mut(ctx).set_loc(loc.clone());
-
-        // Set mutable attribute (true for &mut)
-        let bool_type = IntegerType::get(ctx, 1, Signedness::Unsigned);
-        let mutable_attr =
-            IntegerAttr::new(bool_type, APInt::from_i64(1, NonZeroUsize::new(1).unwrap()));
-        ref_op.deref_mut(ctx).attributes.0.insert(
-            Identifier::try_from("mutable").unwrap(),
-            mutable_attr.into(),
-        );
-
-        // Insert after previous op
-        if let Some(prev) = last_op {
-            ref_op.insert_after(ctx, prev);
-        } else {
-            ref_op.insert_at_front(block_ptr, ctx);
+    // Derive the exact receiver reference from the closure body's first
+    // parameter. A ClosureOnce adapter may pass the closure by value and need
+    // a synthesized borrow. A direct `FnMut::call_mut` can also resolve to an
+    // `Fn` closure body: MIR then supplies `&mut Closure` while that body
+    // expects `&Closure`, so preserve the existing address with an explicit
+    // reborrow instead of taking the address of the reference value itself.
+    let receiver_borrow_mutability = match closure_body.receiver_ty.kind() {
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Ref(_, _, mutability))
+            if self_value.get_type(ctx) != expected_receiver_type =>
+        {
+            Some(mutability)
         }
-        last_op = Some(ref_op);
+        _ => None,
+    };
 
-        // Use the reference as self arg
-        ref_op.deref(ctx).get_result(0)
+    let self_arg = if let Some(mutability) = receiver_borrow_mutability {
+        let is_mutable = mutability == mir::Mutability::Mut;
+
+        if self_value
+            .get_type(ctx)
+            .deref(ctx)
+            .is::<dialect_mir::types::MirPtrType>()
+        {
+            // The callable-trait receiver is already an address. Retype the
+            // same pointee at the Rust reborrow boundary (`&mut C -> &C` for
+            // an Fn closure invoked through FnMut is the common case).
+            let cast_op = Operation::new(
+                ctx,
+                dialect_mir::ops::MirCastOp::get_concrete_op_info(),
+                vec![expected_receiver_type],
+                vec![self_value],
+                vec![],
+                0,
+            );
+            cast_op.deref_mut(ctx).set_loc(loc.clone());
+            let cast = dialect_mir::ops::MirCastOp::new(cast_op);
+            cast.set_attr_cast_kind(ctx, MirCastKindAttr::PtrToPtr);
+            cast.set_pointer_kind_authority(ctx, MirPointerKindAuthorityAttr::Reborrow);
+            if let Some(prev) = last_op {
+                cast_op.insert_after(ctx, prev);
+            } else {
+                cast_op.insert_at_front(block_ptr, ctx);
+            }
+            last_op = Some(cast_op);
+            cast_op.deref(ctx).get_result(0)
+        } else {
+            if !resolved_is_shim {
+                return input_err!(
+                    loc,
+                    TranslationErr::unsupported(
+                        "closure body expects a borrowed receiver but the direct callable-trait argument is not a pointer"
+                            .to_string()
+                    )
+                );
+            }
+
+            // Reproduce the ClosureOnce adapter's borrow before calling the
+            // closure body directly.
+            let ref_op = Operation::new(
+                ctx,
+                dialect_mir::ops::MirRefOp::get_concrete_op_info(),
+                vec![expected_receiver_type],
+                vec![self_value],
+                vec![],
+                0,
+            );
+            ref_op.deref_mut(ctx).set_loc(loc.clone());
+            let ref_op_wrapper = dialect_mir::ops::MirRefOp::new(ref_op);
+            ref_op_wrapper.set_mutable(ctx, is_mutable);
+            ref_op_wrapper.set_pointer_kind_authority(ctx, MirPointerKindAuthorityAttr::Reborrow);
+
+            if let Some(prev) = last_op {
+                ref_op.insert_after(ctx, prev);
+            } else {
+                ref_op.insert_at_front(block_ptr, ctx);
+            }
+            last_op = Some(ref_op);
+            ref_op.deref(ctx).get_result(0)
+        }
     } else {
-        // For call_mut/call: self is already a reference, use as-is
+        // For call_mut/call the MIR operand is already the body's exact
+        // reference type; for FnOnce the body receives the value unchanged.
         self_value
     };
 
-    // Build unpacked arguments: start with self (or ref to self for call_once)
+    if self_arg.get_type(ctx) != expected_receiver_type {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "closure call receiver type does not match the resolved closure body parameter"
+                    .to_string()
+            )
+        );
+    }
+
+    // Build unpacked arguments, starting with the original or adapted receiver.
     let mut unpacked_args = vec![self_arg];
 
     // Unpack the tuple - extract each field
@@ -1256,6 +1870,22 @@ fn translate_closure_call(
         unpacked_args.push(tuple_value);
     }
 
+    let prepared_destination = if target.is_some() {
+        let (prepared, prepared_last_op) = helpers::prepare_destination_write(
+            ctx,
+            body,
+            destination,
+            value_map,
+            block_ptr,
+            last_op,
+            loc.clone(),
+        )?;
+        last_op = prepared_last_op;
+        Some(prepared)
+    } else {
+        None
+    };
+
     // Now emit the call with unpacked arguments
     let call_op = Operation::new(
         ctx,
@@ -1272,8 +1902,7 @@ fn translate_closure_call(
     call_op
         .deref_mut(ctx)
         .attributes
-        .0
-        .insert(Identifier::try_from("callee").unwrap(), callee_attr.into());
+        .set(Identifier::try_from("callee").unwrap(), callee_attr);
 
     // Insert the call
     let call_op = if let Some(prev) = last_op {
@@ -1284,17 +1913,20 @@ fn translate_closure_call(
         call_op
     };
 
-    // Store the call result into the destination local's slot.
+    if target.is_none() {
+        return Ok(emit_unreachable_after(ctx, block_ptr, Some(call_op), loc));
+    }
+
     let result_value = call_op.deref(ctx).get_result(0);
-    let last_inserted = value_map
-        .store_local(
-            ctx,
-            destination.local,
-            result_value,
-            block_ptr,
-            Some(call_op),
-        )
-        .unwrap_or(call_op);
+    let last_inserted = helpers::finish_destination_write(
+        ctx,
+        prepared_destination.expect("returning call prepared its destination"),
+        result_value,
+        value_map,
+        block_ptr,
+        call_op,
+        loc.clone(),
+    )?;
 
     // Emit goto to target
     if let Some(target_idx) = target {
@@ -1310,31 +1942,251 @@ fn translate_closure_call(
     }
 }
 
-/// Extracts the closure body's mangled name from a closure operand.
+/// Terminates the block with a bare `mir.unreachable`.
 ///
-/// In unified compilation with `std`, when we see a call like:
+/// Only for paths that can never execute: rustc-proven unreachability
+/// (`TerminatorKind::Unreachable`) or code after a call that is emitted into
+/// the module and genuinely never returns.
+///
+/// Runtime-reachable panic paths whose diverging call is dropped must use
+/// [`emit_trap_unreachable_after`] instead.
+fn emit_unreachable_after(
+    ctx: &mut Context,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> Ptr<Operation> {
+    let op = Operation::new(
+        ctx,
+        dialect_mir::ops::MirUnreachableOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    op.deref_mut(ctx).set_loc(loc);
+    if let Some(prev) = prev_op {
+        op.insert_after(ctx, prev);
+    } else {
+        op.insert_at_front(block_ptr, ctx);
+    }
+    op
+}
+
+/// Returns true for the panic entry points in `core` (and the `std`
+/// re-export) that mark a basic block as a panic path.
+///
+/// This is the single source of truth for that test. The codegen collector
+/// (`rustc-codegen-cuda/src/collector.rs`) imports it so the callees it
+/// deliberately does not collect are exactly the calls this translator drops
+/// in favour of a device trap: every call this predicate accepts has to be
+/// dropped here instead of being emitted as a call to a symbol the module
+/// never defines.
+///
+/// The substring match is intentionally broad: a user function whose path
+/// contains a `panicking` module segment is also treated as a panic entry
+/// and trapped rather than translated.
+pub fn is_panic_entry_path(fn_path: &str) -> bool {
+    fn_path.contains("::panicking::") || fn_path.contains("::rt::panic")
+}
+
+/// True when `term` is a diverging call into a panic entry point, i.e. exactly
+/// the shape `translate_call` (private to this module) drops in favour of a
+/// device trap.
+///
+/// Callers use this to recognize a block that lowers to nothing but a trap,
+/// before spending any work on its contents.
+pub fn is_dropped_panic_call(term: &mir::Terminator) -> bool {
+    let mir::TerminatorKind::Call {
+        func: mir::Operand::Constant(const_op),
+        target: None,
+        ..
+    } = &term.kind
+    else {
+        return false;
+    };
+    let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(fn_def, _)) =
+        const_op.const_.ty().kind()
+    else {
+        return false;
+    };
+    is_panic_entry_path(fn_def.name().as_str())
+}
+
+/// Lowers a block whose terminator [`is_dropped_panic_call`] to the device
+/// trap alone, at the panic call's source location.
+pub fn emit_dropped_panic_trap(
+    ctx: &mut Context,
+    term: &mir::Terminator,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+) -> Ptr<Operation> {
+    let loc = span_to_location(ctx, term.source_info.span);
+    emit_trap_unreachable_after(ctx, block_ptr, prev_op, loc)
+}
+
+/// Terminates the block with `nvvm.trap` followed by `mir.unreachable`.
+///
+/// For runtime-reachable diverging paths whose call is not emitted (dropped
+/// panic calls). A thread reaching it aborts the kernel (`trap;` in PTX).
+fn emit_trap_unreachable_after(
+    ctx: &mut Context,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> Ptr<Operation> {
+    let trap_op = dialect_nvvm::ops::TrapOp::build(ctx);
+    trap_op.deref_mut(ctx).set_loc(loc.clone());
+    // `nvvm.trap` is a generated intrinsic; the target-requirements
+    // verifier rejects it without its exact ABI marker (`i0295` is
+    // trap's append-only id in intrinsics/abi-v1.toml, the same marker
+    // the generated `debug::trap` dispatch attaches).
+    helpers::set_generated_intrinsic_marker(ctx, trap_op, "v1:i0295");
+    if let Some(prev) = prev_op {
+        trap_op.insert_after(ctx, prev);
+    } else {
+        trap_op.insert_at_front(block_ptr, ctx);
+    }
+    emit_unreachable_after(ctx, block_ptr, Some(trap_op), loc)
+}
+
+/// True only when the rust-call receiver is itself a closure.
+fn receiver_is_closure(receiver: &mir::Operand, body: &mir::Body) -> bool {
+    let Some(ty) = operand_type(receiver, body) else {
+        return false;
+    };
+
+    let inner = match ty.kind() {
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Ref(_, inner, _)) => inner,
+        _ => ty,
+    };
+
+    matches!(
+        inner.kind(),
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Closure(_, _))
+    )
+}
+
+struct FunctionItemTarget {
+    name: String,
+    requires_direct_dispatch: bool,
+}
+
+fn extract_function_item_target(
+    receiver: &mir::Operand,
+    body: &mir::Body,
+    loc: &Location,
+) -> TranslationResult<Option<FunctionItemTarget>> {
+    let Some(ty) = operand_type(receiver, body) else {
+        return Ok(None);
+    };
+    let inner = match ty.kind() {
+        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Ref(_, inner, _)) => inner,
+        _ => ty,
+    };
+
+    let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(fn_def, substs)) =
+        inner.kind()
+    else {
+        return Ok(None);
+    };
+
+    let Some(instance) = rustc_public::mir::mono::Instance::resolve(fn_def, &substs).ok() else {
+        return Ok(None);
+    };
+    let crate_name = fn_def.krate().name;
+    let generated_direct_call_only =
+        intrinsics::generated::require_supported_raw_intrinsic(fn_def, loc)?.is_some();
+    Ok(Some(FunctionItemTarget {
+        name: function_item_call_name(instance),
+        requires_direct_dispatch: fn_def.is_intrinsic()
+            || instance.is_foreign_item()
+            || !instance.has_body()
+            || matches!(crate_name.as_str(), "cuda_device" | "cuda-device" | "libm")
+            || generated_direct_call_only,
+    }))
+}
+
+fn function_item_call_name(instance: rustc_public::mir::mono::Instance) -> String {
+    if instance.is_foreign_item() || !instance.args().0.is_empty() {
+        instance.mangled_name()
+    } else {
+        instance.name().to_string()
+    }
+}
+
+fn operand_type(receiver: &mir::Operand, body: &mir::Body) -> Option<rustc_public::ty::Ty> {
+    receiver.ty(body.locals()).ok()
+}
+
+struct CallableTraitCallInfo {
+    resolved_is_shim: bool,
+}
+
+/// Recognize the three callable traits by compiler identity available through
+/// `rustc_public`.
+///
+/// These methods are defined in `core`, use the rust-call ABI, and have an
+/// exact parent/method pair (`Fn::call`, `FnMut::call_mut`, or
+/// `FnOnce::call_once`). The combined check cannot be spoofed by a user item
+/// whose name merely contains one of those strings. The resolved instance may
+/// be either a shim or the closure body itself, so instance kind is returned as
+/// lowering information rather than used as the recognition predicate.
+fn callable_trait_call_info(func: &mir::Operand) -> Option<CallableTraitCallInfo> {
+    use rustc_public::mir::mono::{Instance, InstanceKind};
+    use rustc_public::ty::{Abi, RigidTy, TyKind};
+
+    let mir::Operand::Constant(const_op) = func else {
+        return None;
+    };
+    let TyKind::RigidTy(RigidTy::FnDef(fn_def, substs)) = const_op.const_.ty().kind() else {
+        return None;
+    };
+    if fn_def.fn_sig().skip_binder().abi != Abi::RustCall || fn_def.krate().name.as_str() != "core"
+    {
+        return None;
+    }
+
+    let method_name = fn_def.def_id().name();
+    let method = method_name.as_str().rsplit("::").next()?;
+    let parent_name = fn_def.def_id().parent()?.name();
+    let parent = parent_name.as_str().rsplit("::").next()?;
+    let is_callable_method = matches!(
+        (parent, method),
+        ("Fn", "call") | ("FnMut", "call_mut") | ("FnOnce", "call_once")
+    );
+    if !is_callable_method {
+        return None;
+    }
+
+    let instance = Instance::resolve(fn_def, &substs).ok()?;
+    Some(CallableTraitCallInfo {
+        resolved_is_shim: instance.kind == InstanceKind::Shim,
+    })
+}
+
+struct ClosureBodyTarget {
+    name: String,
+    receiver_ty: rustc_public::ty::Ty,
+}
+
+/// Resolves the closure body and its actual receiver parameter.
+///
+/// When instance resolution selects an adapter shim for a call like:
 ///   `<{closure} as FnOnce<(u32,)>>::call_once(closure_ref, args_tuple)`
 ///
-/// The `call_name` from `Instance::resolve` gives us the trait method shim's name,
-/// not the closure body. We need to extract the closure's DefId from `args[0]`'s type
-/// and resolve that to get the actual closure body's mangled name.
+/// the resolved call name identifies the shim, not the closure body. Extract
+/// the closure's DefId from `args[0]` and resolve the body independently.
 ///
 /// The closure argument can be:
 /// - A direct closure value (type is `Closure(def, substs)`)
 /// - A reference to a closure (type is `Ref(_, Closure(def, substs), _)`)
 /// - A mutable reference (same pattern)
-fn extract_closure_body_name(closure_arg: &mir::Operand, body: &mir::Body) -> Option<String> {
-    // Get the type of the closure argument
-    let closure_ty = match closure_arg {
-        mir::Operand::Copy(place) | mir::Operand::Move(place) => {
-            // Get the type from the place's local
-            let local: usize = place.local;
-            let local_decls: Vec<_> = body.local_decls().collect();
-            local_decls.get(local).map(|(_, decl)| decl.ty)
-        }
-        mir::Operand::Constant(const_op) => Some(const_op.const_.ty()),
-        _ => None,
-    }?;
+fn extract_closure_body_target(
+    closure_arg: &mir::Operand,
+    body: &mir::Body,
+) -> Option<ClosureBodyTarget> {
+    let closure_ty = operand_type(closure_arg, body)?;
 
     // Unwrap references to get the actual closure type
     let inner_ty = match closure_ty.kind() {
@@ -1350,8 +2202,8 @@ fn extract_closure_body_name(closure_arg: &mir::Operand, body: &mir::Body) -> Op
         _ => return None,
     };
 
-    // Get the closure body instance directly, NOT through resolve_closure
-    // (which returns a call_once shim in unified/std compilation).
+    // Get the closure body instance directly. Resolving the callable-trait
+    // method can legitimately select a ClosureOnce adapter instead.
     //
     // The closure_def.def_id() gives us the DefId of the closure body.
     // We construct the mangled name by creating an FnDef and resolving it.
@@ -1361,14 +2213,74 @@ fn extract_closure_body_name(closure_arg: &mir::Operand, body: &mir::Body) -> Op
     // Create an FnDef from the closure's DefId
     let fn_def = FnDef(closure_def.def_id());
 
-    if let Ok(instance) = Instance::resolve(fn_def, &substs) {
-        return Some(instance.mangled_name());
-    }
+    let instance = Instance::resolve(fn_def, &substs).ok().or_else(|| {
+        // Fallback: try the old resolve_closure method.
+        Instance::resolve_closure(closure_def, &substs, rustc_public::ty::ClosureKind::FnOnce).ok()
+    })?;
+    let receiver_ty = instance.body()?.arg_locals().first()?.ty;
 
-    // Fallback: try the old resolve_closure method
-    Instance::resolve_closure(closure_def, &substs, rustc_public::ty::ClosureKind::FnOnce)
-        .ok()
-        .map(|instance| instance.mangled_name())
+    Some(ClosureBodyTarget {
+        name: instance.mangled_name(),
+        receiver_ty,
+    })
+}
+
+/// Read the const-generic `FACTOR` from a `__unroll_config::<FACTOR>()` callee
+/// (`0` = full unroll).
+///
+/// Returns `None` when the callee is malformed instead of silently turning the
+/// request into a full unroll.
+fn extract_unroll_factor(func: &mir::Operand) -> Option<u32> {
+    use rustc_public::ty::{RigidTy, TyConstKind, TyKind};
+    let mir::Operand::Constant(constant) = func else {
+        return None;
+    };
+    let TyKind::RigidTy(RigidTy::FnDef(definition, args)) = constant.const_.ty().kind() else {
+        return None;
+    };
+    let definition_name = definition.name();
+    if definition.krate().name.as_str() != "cuda_device"
+        || (definition_name != "__unroll_config" && !definition_name.ends_with("::__unroll_config"))
+        || args.0.len() != 1
+    {
+        return None;
+    }
+    if let Some(arg) = args.0.first()
+        && let rustc_public::ty::GenericArgKind::Const(c) = arg
+    {
+        return match c.kind() {
+            TyConstKind::Value(_, alloc) => {
+                alloc.read_uint().ok().and_then(|v| u32::try_from(v).ok())
+            }
+            _ => c
+                .eval_target_usize()
+                .ok()
+                .and_then(|v| u32::try_from(v).ok()),
+        };
+    }
+    None
+}
+
+/// Match a compiler marker by its resolved definition, not by a debug string.
+///
+/// A user function with the same spelling must remain an ordinary call. The
+/// `FnDef` identity also guarantees that generic arguments were type-checked by
+/// rustc before the importer reads them.
+fn is_cuda_device_const_marker(func: &mir::Operand, expected_name: &str) -> bool {
+    use rustc_public::CrateDef;
+    use rustc_public::ty::{RigidTy, TyKind};
+
+    let mir::Operand::Constant(constant) = func else {
+        return false;
+    };
+    let TyKind::RigidTy(RigidTy::FnDef(definition, _)) = constant.const_.ty().kind() else {
+        return false;
+    };
+    if definition.krate().name.as_str() != "cuda_device" {
+        return false;
+    }
+    let definition_name = definition.name();
+    definition_name == expected_name || definition_name.ends_with(&format!("::{expected_name}"))
 }
 
 /// Extracts function metadata from a MIR function operand.
@@ -1376,34 +2288,55 @@ fn extract_closure_body_name(closure_arg: &mir::Operand, body: &mir::Body) -> Op
 /// Returns a tuple of:
 /// - `pattern_name`: The function's simple name (e.g., `"cuda_device::index_1d"`)
 /// - `call_name`: The name used for the call target in generated code
-/// - `substs_str`: Debug string of generic substitutions (for pattern matching)
-/// - `func_ret_ty`: The function's return type
+/// - `substs`: the callee's generic substitutions, in declaration order
+///   (`Self` first for trait methods)
+///
+/// Deliberately NOT returned: the callee's declared return type. The
+/// declared `fn_sig` of a trait method is written against the trait, so its
+/// output can be an unresolved associated-type projection such as
+/// `<&Foo as Mul>::Output` (issue #133). Call results are instead typed from
+/// the caller's destination place, which rustc has already monomorphized and
+/// normalized. If a callee-signature type is ever genuinely needed here,
+/// resolve the instance first (`Instance::resolve`) and query the signature
+/// on the resolved instance so associated types arrive normalized.
 ///
 /// This information is used to:
 /// 1. Match intrinsic patterns by `pattern_name` (full FQDN, e.g. `cuda_device::thread::threadIdx_x`)
-/// 2. Check for closure types via `substs_str.contains("Closure")`
+/// 2. Read the trait-method `Self` type from the substs (Index/IndexMut on
+///    `SharedArray`) and const generics (`DynamicSharedArray`'s `ALIGN`)
 /// 3. Generate the correct call target name (FQDN for non-generic, mangled for generic)
 ///
 /// # Naming strategy
 ///
-/// `CrateDef::name()` returns the fully qualified name (FQDN) in the `rustc_public`
-/// API (e.g. `helper_fn::cuda_oxide_device_<hash>_vecadd_device`). We use this directly as
-/// both `pattern_name` and `call_name` (for non-generic calls). The collector
-/// produces matching FQDNs, and the lowering layer (`mir-lower`) converts `::` to
-/// `__` on both sides to produce valid LLVM/PTX identifiers.
+/// `CrateDef::name()` returns the fully qualified name (FQDN) in the
+/// `rustc_public` API (e.g. `helper_fn::cuda_oxide_device_<hash>_vecadd_device`).
+/// We use the raw `FnDef` name as `pattern_name` for intrinsic matching, then
+/// use the resolved `Instance::name()` as `call_name` for monomorphic calls.
+/// Raw `FnDef` substitutions are not authoritative for this decision: concrete
+/// trait impl calls can carry a trait self type in the operand while resolving
+/// to a monomorphic instance, and the resolved impl FQDN can differ from the
+/// trait item FQDN.
 ///
-/// For generic calls, `Instance::resolve` + `mangled_name` is used instead, which
-/// the collector also matches via `compute_export_name`.
+/// For resolved instances that still carry generic args, `Instance::mangled_name`
+/// is used instead, which the collector also matches via `compute_export_name`.
+/// Non-generic FQDNs with characters such as `<`, `>`, and `::` are passed raw to
+/// the same pliron `Legaliser` used for definition symbols.
 ///
+/// Foreign items (`extern "C"` block declarations) are the exception: they
+/// have no MIR body, so the collector never exports a definition under the
+/// FQDN and the device linker (libdevice, external LTOIR) only knows the
+/// link symbol. `call_name` for those is `Instance::mangled_name`, which is
+/// the link symbol (it honours `#[link_name]`).
 fn extract_func_info(
     func: &mir::Operand,
-) -> (
+    loc: &Location,
+) -> TranslationResult<(
     Option<String>,
     Option<String>,
-    Option<String>,
-    Option<rustc_public::ty::Ty>,
-) {
-    match func {
+    Option<rustc_public::ty::GenericArgs>,
+    Vec<rustc_public::ty::Ty>,
+)> {
+    Ok(match func {
         mir::Operand::Constant(const_op) => match const_op.const_.kind() {
             ConstantKind::ZeroSized => {
                 let ty_kind = const_op.const_.ty().kind();
@@ -1412,40 +2345,298 @@ fn extract_func_info(
                         fn_def,
                         substs,
                     )) => {
-                        let pattern_name = fn_def.name().as_str().to_string();
+                        use rustc_public::mir::mono::Instance;
 
-                        let has_generic_args = !substs.0.is_empty();
-                        let call_name = if has_generic_args {
-                            use rustc_public::mir::mono::Instance;
-                            if let Ok(instance) = Instance::resolve(*fn_def, substs) {
+                        let pattern_name =
+                            intrinsics::generated::require_supported_raw_intrinsic(*fn_def, loc)?
+                                .unwrap_or_else(|| fn_def.name().as_str().to_string());
+
+                        let resolved = Instance::resolve(*fn_def, substs).ok();
+                        let call_name = if let Some(instance) = resolved {
+                            if instance.is_foreign_item() {
+                                // Foreign items (`extern "C"` blocks) have no MIR
+                                // body, so no definition is ever exported under
+                                // the FQDN. Emit the call under the link symbol
+                                // (e.g. `__nv_asinf`), which is what libdevice or
+                                // externally linked LTOIR actually provides.
+                                instance.mangled_name()
+                            } else if !instance.args().0.is_empty() {
                                 instance.mangled_name()
                             } else {
-                                pattern_name.clone()
+                                instance.name().to_string()
                             }
                         } else {
                             pattern_name.clone()
                         };
 
-                        let substs_debug = format!("{:?}", substs);
-                        let sig = ty_kind
-                            .fn_sig()
-                            .expect("FnDef should have fn_sig")
-                            .skip_binder();
-                        let ret_ty = sig.output();
+                        let type_substs = substs
+                            .0
+                            .iter()
+                            .filter_map(|arg| match arg {
+                                rustc_public::ty::GenericArgKind::Type(ty) => Some(*ty),
+                                _ => None,
+                            })
+                            .collect();
                         (
                             Some(pattern_name),
                             Some(call_name),
-                            Some(substs_debug),
-                            Some(ret_ty),
+                            Some(substs.clone()),
+                            type_substs,
                         )
                     }
-                    _ => (None, None, None, None),
+                    _ => (None, None, None, vec![]),
                 }
             }
-            _ => (None, None, None, None),
+            _ => (None, None, None, vec![]),
         },
-        _ => (None, None, None, None),
+        _ => (None, None, None, vec![]),
+    })
+}
+
+/// Emit `core::intrinsics::copy` (`ptr::copy`) as a `mir.memmove`.
+///
+/// rustc's intrinsic argument order is `(src, dst, count)` with `count` in
+/// pointee elements; `mir.memmove` takes `(dst, src, count)`, so the pointers
+/// are reordered here. `copy` is the overlap-safe variant, so it lowers to
+/// `llvm.memmove` (the non-overlapping `copy_nonoverlapping` instead reaches
+/// MIR as a `CopyNonOverlapping` statement and lowers to `mir.memcpy`). The
+/// intrinsic returns `()`, so a unit value is produced for the destination
+/// before branching to the target, mirroring `emit_typed_swap`.
+#[allow(clippy::too_many_arguments)]
+fn emit_ptr_memmove(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use dialect_mir::ops::{MirConstructTupleOp, MirMemmoveOp};
+    use dialect_mir::types::MirTupleType;
+
+    if args.len() != 3 {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "ptr::copy intrinsic requires (src, dst, count) operands".to_string()
+            )
+        );
     }
+
+    // rustc order: (src, dst, count).
+    let (src, last) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+    let (dst, last) =
+        rvalue::translate_operand(ctx, body, &args[1], value_map, block_ptr, last, loc.clone())?;
+    let (count, last) =
+        rvalue::translate_operand(ctx, body, &args[2], value_map, block_ptr, last, loc.clone())?;
+
+    let (prepared_destination, prepared_last_op) = helpers::prepare_destination_write(
+        ctx,
+        body,
+        destination,
+        value_map,
+        block_ptr,
+        last,
+        loc.clone(),
+    )?;
+
+    // `mir.memmove` operand order is (dst, src, count). The typed builder
+    // stamps the elem_type fact from dst for lowering's byte count.
+    let xfer = MirMemmoveOp::build(ctx, dst, src, count)?;
+    xfer.deref_mut(ctx).set_loc(loc.clone());
+    match prepared_last_op {
+        Some(p) => xfer.insert_after(ctx, p),
+        None => xfer.insert_at_front(block_ptr, ctx),
+    }
+
+    // The intrinsic yields `()`; materialize it after the memmove and write it
+    // through the destination prepared before the memory operation ran.
+    let unit_ty = MirTupleType::get(ctx, vec![]);
+    let unit_op = Operation::new(
+        ctx,
+        MirConstructTupleOp::get_concrete_op_info(),
+        vec![unit_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    unit_op.deref_mut(ctx).set_loc(loc.clone());
+    unit_op.insert_after(ctx, xfer);
+    let unit_val = unit_op.deref(ctx).get_result(0);
+
+    helpers::emit_prepared_result_and_goto(
+        ctx,
+        prepared_destination,
+        unit_val,
+        target,
+        block_ptr,
+        unit_op,
+        value_map,
+        block_map,
+        loc,
+        "ptr::copy intrinsic call without target not supported",
+    )
+}
+
+/// Lower `core::intrinsics::typed_swap_nonoverlapping::<T>(x, y)`, the
+/// primitive behind `core::mem::swap`/`mem::replace`, as load/load/store/store.
+/// The two pointers are guaranteed non-overlapping, so the temp-free crossover
+/// `t0 = *x; t1 = *y; *x = t1; *y = t0` is valid (the loaded SSA values are
+/// captured before either store runs). Returns a unit result + goto target.
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_swap(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use dialect_mir::ops::{MirConstructTupleOp, MirLoadOp, MirStoreOp};
+    use dialect_mir::types::{MirPtrType, MirTupleType};
+
+    if args.len() != 2 {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "typed_swap_nonoverlapping requires two pointer operands".to_string()
+            )
+        );
+    }
+
+    let (ptr_x, last) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        prev_op,
+        loc.clone(),
+    )?;
+    let (ptr_y, last) =
+        rvalue::translate_operand(ctx, body, &args[1], value_map, block_ptr, last, loc.clone())?;
+
+    let elem_ty = {
+        let t = ptr_x.get_type(ctx);
+        let r = t.deref(ctx);
+        match r.downcast_ref::<MirPtrType>() {
+            Some(p) => p.pointee,
+            None => {
+                return input_err!(
+                    loc,
+                    TranslationErr::unsupported(
+                        "typed_swap_nonoverlapping operand is not a pointer".to_string()
+                    )
+                );
+            }
+        }
+    };
+
+    let (prepared_destination, prepared_last_op) = helpers::prepare_destination_write(
+        ctx,
+        body,
+        destination,
+        value_map,
+        block_ptr,
+        last,
+        loc.clone(),
+    )?;
+
+    // t0 = *x
+    let load_x = Operation::new(
+        ctx,
+        MirLoadOp::get_concrete_op_info(),
+        vec![elem_ty],
+        vec![ptr_x],
+        vec![],
+        0,
+    );
+    load_x.deref_mut(ctx).set_loc(loc.clone());
+    match prepared_last_op {
+        Some(p) => load_x.insert_after(ctx, p),
+        None => load_x.insert_at_front(block_ptr, ctx),
+    }
+    let vx = load_x.deref(ctx).get_result(0);
+
+    // t1 = *y
+    let load_y = Operation::new(
+        ctx,
+        MirLoadOp::get_concrete_op_info(),
+        vec![elem_ty],
+        vec![ptr_y],
+        vec![],
+        0,
+    );
+    load_y.deref_mut(ctx).set_loc(loc.clone());
+    load_y.insert_after(ctx, load_x);
+    let vy = load_y.deref(ctx).get_result(0);
+
+    // *x = t1
+    let store_x = Operation::new(
+        ctx,
+        MirStoreOp::get_concrete_op_info(),
+        vec![],
+        vec![ptr_x, vy],
+        vec![],
+        0,
+    );
+    store_x.deref_mut(ctx).set_loc(loc.clone());
+    store_x.insert_after(ctx, load_y);
+
+    // *y = t0
+    let store_y = Operation::new(
+        ctx,
+        MirStoreOp::get_concrete_op_info(),
+        vec![],
+        vec![ptr_y, vx],
+        vec![],
+        0,
+    );
+    store_y.deref_mut(ctx).set_loc(loc.clone());
+    store_y.insert_after(ctx, store_x);
+
+    // unit result
+    let unit_ty = MirTupleType::get(ctx, vec![]);
+    let unit_op = Operation::new(
+        ctx,
+        MirConstructTupleOp::get_concrete_op_info(),
+        vec![unit_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    unit_op.deref_mut(ctx).set_loc(loc.clone());
+    unit_op.insert_after(ctx, store_y);
+    let unit_val = unit_op.deref(ctx).get_result(0);
+
+    helpers::emit_prepared_result_and_goto(
+        ctx,
+        prepared_destination,
+        unit_val,
+        target,
+        block_ptr,
+        unit_op,
+        value_map,
+        block_map,
+        loc,
+        "typed_swap_nonoverlapping call without target not supported",
+    )
 }
 
 /// Dispatches `cuda_device` intrinsic calls to their respective handlers.
@@ -1460,15 +2651,17 @@ fn extract_func_info(
 /// | Index Helpers     | `index_1d`, `index_2d::<S>`, `index_2d_runtime`, `index_2d_row`, `index_2d_col` |
 /// | Synchronization   | `sync_threads`, `mbarrier_*`, `fence_*`           |
 /// | Warp Primitives   | `shuffle_*`, `vote_*`, `lane_id`                  |
-/// | WGMMA (Hopper)    | `wgmma_fence`, `wgmma_mma_*`, `make_smem_desc`    |
+/// | WGMMA (Hopper `sm_90a`) | `wgmma_fence`, `wgmma_mma_*`, `make_smem_desc` |
 /// | TMA               | `cp_async_bulk_tensor_*_g2s/s2g`, `wait_group`    |
 /// | Tcgen05 (Blackwell)| `tcgen05_alloc`, `tcgen05_mma_*`, `tcgen05_ld_*` |
 /// | Memory            | `SharedArray::index`, `stmatrix_*`, `cvt_*`       |
-/// | DisjointSlice     | `get_thread_local`, `len`                         |
+/// | Layout            | `size_of_val`, `align_of_val`                     |
+/// | DisjointSlice     | `len`                                             |
 #[allow(clippy::too_many_arguments)]
 fn try_dispatch_intrinsic(
     ctx: &mut Context,
     body: &mir::Body,
+    func: &mir::Operand,
     name: &str,
     args: &[mir::Operand],
     destination: &mir::Place,
@@ -1478,8 +2671,94 @@ fn try_dispatch_intrinsic(
     value_map: &mut ValueMap,
     block_map: &[Ptr<BasicBlock>],
     loc: Location,
-    substs_contains: &impl Fn(&str) -> bool,
+    on_shared_array: bool,
+    type_substs: &[rustc_public::ty::Ty],
 ) -> TranslationResult<Option<Ptr<Operation>>> {
+    intrinsics::wgmma::reject_unsupported(name, loc.clone())?;
+
+    if let Some(operation) = intrinsics::iket::try_dispatch(
+        ctx,
+        body,
+        name,
+        args,
+        destination,
+        target,
+        block_ptr,
+        prev_op,
+        value_map,
+        block_map,
+        loc.clone(),
+        type_substs,
+    )? {
+        return Ok(Some(operation));
+    }
+
+    if let Some(operation) = intrinsics::generated::try_dispatch_generated_intrinsic(
+        ctx,
+        body,
+        name,
+        args,
+        destination,
+        target,
+        block_ptr,
+        prev_op,
+        value_map,
+        block_map,
+        loc.clone(),
+    )? {
+        return Ok(Some(operation));
+    }
+
+    if let Some(kind) = intrinsics::asm::InlinePtxCallKind::from_path(name) {
+        return Ok(Some(intrinsics::asm::emit_inline_ptx(
+            ctx,
+            body,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+            kind,
+        )?));
+    }
+
+    if name == "core::intrinsics::typed_swap_nonoverlapping"
+        || name == "std::intrinsics::typed_swap_nonoverlapping"
+    {
+        return Ok(Some(emit_typed_swap(
+            ctx,
+            body,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?));
+    }
+
+    if let Some(intrinsic) = intrinsics::layout::RustLayoutIntrinsic::from_core_path(name) {
+        return Ok(Some(intrinsics::layout::emit_rust_layout_intrinsic(
+            ctx,
+            body,
+            intrinsic,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+            type_substs,
+        )?));
+    }
+
     if let Some(intrinsic) = intrinsics::bitops::RustBitIntrinsic::from_core_path(name) {
         return Ok(Some(intrinsics::bitops::emit_rust_bit_intrinsic(
             ctx,
@@ -1514,6 +2793,54 @@ fn try_dispatch_intrinsic(
         ));
     }
 
+    if let Some(intrinsic) = intrinsics::exact_div::RustExactDivIntrinsic::from_core_path(name) {
+        return Ok(Some(intrinsics::exact_div::emit_rust_exact_div_intrinsic(
+            ctx,
+            body,
+            intrinsic,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?));
+    }
+
+    if let Some(intrinsic) = intrinsics::bigint::RustBigIntIntrinsic::from_core_path(name) {
+        return Ok(Some(intrinsics::bigint::emit_rust_bigint_intrinsic(
+            ctx,
+            body,
+            intrinsic,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?));
+    }
+
+    if let Some(is_f64) = intrinsics::float_math::libm_sincos_is_f64(name) {
+        return Ok(Some(intrinsics::float_math::emit_sincos(
+            ctx,
+            body,
+            is_f64,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?));
+    }
+
     if let Some(intrinsic) = intrinsics::float_math::RustFloatMathIntrinsic::from_core_path(name) {
         return Ok(Some(
             intrinsics::float_math::emit_rust_float_math_intrinsic(
@@ -1540,6 +2867,7 @@ fn try_dispatch_intrinsic(
         "core::intrinsics::cold_path" | "std::intrinsics::cold_path" => {
             Ok(Some(helpers::emit_unit_noop_intrinsic(
                 ctx,
+                body,
                 destination,
                 target,
                 block_ptr,
@@ -1550,317 +2878,7 @@ fn try_dispatch_intrinsic(
                 name,
             )?))
         }
-
-        // =================================================================
-        // Thread/Block Position Intrinsics
-        // Support both re-exported (cuda_device::) and full paths (cuda_device::thread::)
-        // =================================================================
-        "cuda_device::threadIdx_x" | "cuda_device::thread::threadIdx_x" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                ReadPtxSregTidXOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::threadIdx_y" | "cuda_device::thread::threadIdx_y" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                ReadPtxSregTidYOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::blockIdx_x" | "cuda_device::thread::blockIdx_x" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                ReadPtxSregCtaidXOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::blockIdx_y" | "cuda_device::thread::blockIdx_y" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                ReadPtxSregCtaidYOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::blockDim_x" | "cuda_device::thread::blockDim_x" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                ReadPtxSregNtidXOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::blockDim_y" | "cuda_device::thread::blockDim_y" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                ReadPtxSregNtidYOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::threadIdx_z" | "cuda_device::thread::threadIdx_z" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                dialect_nvvm::ops::ReadPtxSregTidZOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::blockIdx_z" | "cuda_device::thread::blockIdx_z" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                dialect_nvvm::ops::ReadPtxSregCtaidZOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::blockDim_z" | "cuda_device::thread::blockDim_z" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                dialect_nvvm::ops::ReadPtxSregNtidZOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::gridDim_x" | "cuda_device::thread::gridDim_x" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                dialect_nvvm::ops::ReadPtxSregNctaidXOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::gridDim_y" | "cuda_device::thread::gridDim_y" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                dialect_nvvm::ops::ReadPtxSregNctaidYOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::gridDim_z" | "cuda_device::thread::gridDim_z" => {
-            Ok(Some(helpers::emit_nvvm_intrinsic(
-                ctx,
-                dialect_nvvm::ops::ReadPtxSregNctaidZOp::get_concrete_op_info(),
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::grid::envreg1" => Ok(Some(helpers::emit_nvvm_intrinsic(
-            ctx,
-            dialect_nvvm::ops::ReadPtxSregEnvReg1Op::get_concrete_op_info(),
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::grid::envreg2" => Ok(Some(helpers::emit_nvvm_intrinsic(
-            ctx,
-            dialect_nvvm::ops::ReadPtxSregEnvReg2Op::get_concrete_op_info(),
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-
-        // =================================================================
-        // Thread Index Helpers (from intrinsics::indexing)
-        // Support both re-exported (cuda_device::) and full paths (cuda_device::thread::)
-        //
-        // TODO: These three handlers (index_1d, index_2d_row, index_2d_col) are not
-        // strictly necessary. Their Rust bodies are real code that calls true intrinsics
-        // (threadIdx_x, blockIdx_y, etc.), so they compile correctly through the normal
-        // function path. They exist as a reliability workaround because #[inline(always)]
-        // is not always honored by rustc — without these handlers, a non-inlined call
-        // would require compiling the function body separately. The arithmetic expansion
-        // is trivial (3 ops + cast), so we keep them for now. If rustc inlining becomes
-        // reliable, these can be removed along with emit_index_1d_expansion,
-        // emit_index_2d_row, and emit_index_2d_col in intrinsics/indexing.rs.
-        // =================================================================
-        "cuda_device::thread::__internal::index_1d"
-        | "cuda_device::index_1d"
-        | "cuda_device::thread::index_1d" => {
-            Ok(Some(intrinsics::indexing::emit_index_1d_expansion(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::index_2d_row" | "cuda_device::thread::index_2d_row" => {
-            Ok(Some(intrinsics::indexing::emit_index_2d_row(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::index_2d_col" | "cuda_device::thread::index_2d_col" => {
-            Ok(Some(intrinsics::indexing::emit_index_2d_col(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        // index_2d returns Option<ThreadIndex> with an internal col < stride check.
-        // It is compiled as a normal function (not expanded inline) so that the
-        // Option construction and branch are handled by the standard MIR translator.
-        "cuda_device::thread::__internal::index_2d"
-        | "cuda_device::thread::__internal::index_2d_runtime"
-        | "cuda_device::index_2d"
-        | "cuda_device::thread::index_2d"
-        | "cuda_device::index_2d_runtime"
-        | "cuda_device::thread::index_2d_runtime" => Ok(None),
-
-        // =================================================================
-        // Synchronization (from intrinsics::sync)
-        // =================================================================
-        "cuda_device::sync_threads" => Ok(Some(intrinsics::sync::emit_sync_threads(
-            ctx, target, block_ptr, prev_op, block_map, loc,
-        )?)),
-        "cuda_device::threadfence_block" | "cuda_device::fence::threadfence_block" => {
-            Ok(Some(intrinsics::sync::emit_threadfence_block(
-                ctx, target, block_ptr, prev_op, block_map, loc,
-            )?))
-        }
-        "cuda_device::threadfence" | "cuda_device::fence::threadfence" => Ok(Some(
-            intrinsics::sync::emit_threadfence(ctx, target, block_ptr, prev_op, block_map, loc)?,
-        )),
-        "cuda_device::threadfence_system" | "cuda_device::fence::threadfence_system" => {
-            Ok(Some(intrinsics::sync::emit_threadfence_system(
-                ctx, target, block_ptr, prev_op, block_map, loc,
-            )?))
-        }
-        "cuda_device::barrier::mbarrier_init" => Ok(Some(intrinsics::sync::emit_mbarrier_init(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-        )?)),
-        "cuda_device::barrier::mbarrier_arrive" => {
-            Ok(Some(intrinsics::sync::emit_mbarrier_arrive(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::barrier::mbarrier_arrive_expect_tx" => {
-            Ok(Some(intrinsics::sync::emit_mbarrier_arrive_expect_tx(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::barrier::mbarrier_arrive_cluster" => {
-            Ok(Some(intrinsics::sync::emit_mbarrier_arrive_cluster(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::barrier::nanosleep" => Ok(Some(intrinsics::sync::emit_nanosleep(
+        "core::intrinsics::copy" | "std::intrinsics::copy" => Ok(Some(emit_ptr_memmove(
             ctx,
             body,
             args,
@@ -1872,8 +2890,32 @@ fn try_dispatch_intrinsic(
             block_map,
             loc,
         )?)),
-        "cuda_device::barrier::mbarrier_test_wait" => {
-            Ok(Some(intrinsics::sync::emit_mbarrier_test_wait(
+        "core::intrinsics::select_unpredictable" | "std::intrinsics::select_unpredictable" => {
+            // `select_unpredictable(b, true_val, false_val)` is the
+            // compiler-hint form of `if b { true_val } else { false_val }`,
+            // a branchless ternary libcore emits from sorting/`Ord` helpers.
+            // Emit a placeholder call carrying the three operands; mir-lower
+            // turns it into an LLVM `select`. `bool` lowers to `i1`, exactly
+            // what the select condition needs.
+            let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
+            Ok(Some(helpers::emit_function_call(
+                ctx,
+                body,
+                dialect_mir::rust_intrinsics::CALLEE_SELECT_UNPREDICTABLE,
+                args,
+                destination,
+                return_type,
+                None,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+            )?))
+        }
+        "core::intrinsics::volatile_load" | "std::intrinsics::volatile_load" => {
+            Ok(Some(intrinsics::memory::emit_volatile_load(
                 ctx,
                 body,
                 args,
@@ -1886,8 +2928,14 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::barrier::mbarrier_try_wait" => {
-            Ok(Some(intrinsics::sync::emit_mbarrier_try_wait(
+        "core::intrinsics::volatile_store" | "std::intrinsics::volatile_store" => {
+            Ok(Some(intrinsics::memory::emit_volatile_store(
+                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
+            )?))
+        }
+
+        "core::intrinsics::arith_offset" | "std::intrinsics::arith_offset" => {
+            Ok(Some(intrinsics::memory::emit_arith_offset(
                 ctx,
                 body,
                 args,
@@ -1900,8 +2948,9 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::barrier::mbarrier_try_wait_parity" => {
-            Ok(Some(intrinsics::sync::emit_mbarrier_try_wait_parity(
+
+        "core::intrinsics::ptr_offset_from" | "std::intrinsics::ptr_offset_from" => {
+            Ok(Some(intrinsics::memory::emit_ptr_offset_from(
                 ctx,
                 body,
                 args,
@@ -1914,20 +2963,53 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::barrier::mbarrier_inval" => Ok(Some(intrinsics::sync::emit_mbarrier_inval(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-        )?)),
-        "cuda_device::barrier::fence_proxy_async_shared_cta" => {
-            Ok(Some(intrinsics::sync::emit_fence_proxy_async_shared_cta(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
+
+        "core::intrinsics::ptr_offset_from_unsigned"
+        | "std::intrinsics::ptr_offset_from_unsigned" => {
+            Ok(Some(intrinsics::memory::emit_ptr_offset_from_unsigned(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
             )?))
         }
 
         // =================================================================
+        // Thread Index Helpers (from intrinsics::indexing)
+        //
+        // The index helpers are normal Rust functions over generated leaf
+        // intrinsics. Their bodies use the normal function-call path.
+        // =================================================================
+        "cuda_device::thread::__internal::index_1d"
+        | "cuda_device::index_1d"
+        | "cuda_device::thread::index_1d"
+        | "cuda_device::index_2d_row"
+        | "cuda_device::thread::index_2d_row"
+        | "cuda_device::index_2d_col"
+        | "cuda_device::thread::index_2d_col"
+        | "cuda_device::thread::__internal::index_2d"
+        | "cuda_device::thread::__internal::index_2d_runtime"
+        | "cuda_device::index_2d"
+        | "cuda_device::thread::index_2d"
+        | "cuda_device::index_2d_runtime"
+        | "cuda_device::thread::index_2d_runtime"
+        | "cuda_device::thread::__internal::warp_index"
+        | "cuda_device::warp_index"
+        | "cuda_device::thread::warp_index" => Ok(None),
+
+        // =================================================================
         // Debug & Profiling (from intrinsics::debug)
         // =================================================================
-        "cuda_device::debug::clock" => Ok(Some(intrinsics::debug::emit_clock(
+        "cuda_device::debug::__gpu_assertfail" => Ok(Some(intrinsics::debug::emit_assertfail(
             ctx,
+            body,
+            args,
             destination,
             target,
             block_ptr,
@@ -1935,32 +3017,6 @@ fn try_dispatch_intrinsic(
             value_map,
             block_map,
             loc,
-        )?)),
-        "cuda_device::debug::clock64" => Ok(Some(intrinsics::debug::emit_clock64(
-            ctx,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::debug::globaltimer" => Ok(Some(intrinsics::debug::emit_globaltimer(
-            ctx,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::debug::trap" => Ok(Some(intrinsics::debug::emit_trap(
-            ctx, target, block_ptr, prev_op, block_map, loc,
-        )?)),
-        "cuda_device::debug::breakpoint" => Ok(Some(intrinsics::debug::emit_breakpoint(
-            ctx, target, block_ptr, prev_op, block_map, loc,
         )?)),
         "cuda_device::debug::__gpu_vprintf" => Ok(Some(intrinsics::debug::emit_vprintf(
             ctx,
@@ -1976,146 +3032,8 @@ fn try_dispatch_intrinsic(
         )?)),
 
         // =================================================================
-        // Thread Block Clusters (from intrinsics::cluster) - sm_90+
+        // Compile-time cluster configuration
         // =================================================================
-        "cuda_device::cluster::cluster_ctaidX" => {
-            Ok(Some(intrinsics::cluster::emit_cluster_ctaid_x(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::cluster_ctaidY" => {
-            Ok(Some(intrinsics::cluster::emit_cluster_ctaid_y(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::cluster_ctaidZ" => {
-            Ok(Some(intrinsics::cluster::emit_cluster_ctaid_z(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::cluster_nctaidX" => {
-            Ok(Some(intrinsics::cluster::emit_cluster_nctaid_x(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::cluster_nctaidY" => {
-            Ok(Some(intrinsics::cluster::emit_cluster_nctaid_y(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::cluster_nctaidZ" => {
-            Ok(Some(intrinsics::cluster::emit_cluster_nctaid_z(
-                ctx,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::cluster_idx" => Ok(Some(intrinsics::cluster::emit_cluster_idx(
-            ctx,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::cluster::num_clusters" => Ok(Some(intrinsics::cluster::emit_num_clusters(
-            ctx,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::cluster::cluster_sync" => Ok(Some(intrinsics::cluster::emit_cluster_sync(
-            ctx, target, block_ptr, prev_op, block_map, loc,
-        )?)),
-        "cuda_device::cluster::map_shared_rank" => {
-            Ok(Some(intrinsics::cluster::emit_map_shared_rank(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::map_shared_rank_mut" => {
-            // Same implementation as map_shared_rank, just different pointer mutability
-            Ok(Some(intrinsics::cluster::emit_map_shared_rank(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::cluster::dsmem_read_u32" => {
-            Ok(Some(intrinsics::cluster::emit_dsmem_read_u32(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
         "cuda_device::cluster::__cluster_config" => {
             // Compile-time cluster configuration marker from #[cluster(x,y,z)] attribute.
             // The cluster dimensions are extracted in body.rs during MIR scanning.
@@ -2155,10 +3073,37 @@ fn try_dispatch_intrinsic(
                 loc,
             )))
         }
-        "cuda_device::thread::__launch_bounds_config" => {
-            // Compile-time launch bounds marker from #[launch_bounds(max, min)] attribute.
-            // The launch bounds are extracted in body.rs during MIR scanning.
-            // This call generates no runtime code - just emit a goto to the target block.
+        "cuda_device::__launch_bounds_config"
+        | "cuda_device::thread::__launch_bounds_config"
+        | "cuda_device::__launch_contract_config"
+        | "cuda_device::thread::__launch_contract_config"
+        | "cuda_device::__launch_contract_block_config"
+        | "cuda_device::thread::__launch_contract_block_config"
+        | "cuda_device::__unchecked_indexing_config"
+        | "cuda_device::thread::__unchecked_indexing_config" => {
+            let expected_marker = match name {
+                "cuda_device::__launch_bounds_config"
+                | "cuda_device::thread::__launch_bounds_config" => "__launch_bounds_config",
+                "cuda_device::__launch_contract_config"
+                | "cuda_device::thread::__launch_contract_config" => "__launch_contract_config",
+                "cuda_device::__launch_contract_block_config"
+                | "cuda_device::thread::__launch_contract_block_config" => {
+                    "__launch_contract_block_config"
+                }
+                "cuda_device::__unchecked_indexing_config"
+                | "cuda_device::thread::__unchecked_indexing_config" => {
+                    "__unchecked_indexing_config"
+                }
+                _ => unreachable!("launch metadata arm matched an unknown marker"),
+            };
+            if !is_cuda_device_const_marker(func, expected_marker) {
+                return Ok(None);
+            }
+            // Compile-time metadata marker. Launch bounds and the
+            // unchecked-indexing flag are extracted in body.rs; the contract
+            // marker selects the kernel's typed launch context during macro
+            // expansion. No marker emits runtime code. Emit only the
+            // control-flow edge to the call's target.
             //
             // We need a prev_op to insert after. If none exists, create a dummy constant.
             let actual_prev_op = match prev_op {
@@ -2188,261 +3133,50 @@ fn try_dispatch_intrinsic(
             };
             Ok(Some(helpers::emit_goto(
                 ctx,
-                target.expect("__launch_bounds_config must have target"),
+                target.expect("launch metadata marker must have target"),
                 actual_prev_op,
                 block_map,
                 loc,
             )))
         }
-
-        // =================================================================
-        // Warp Primitives (from intrinsics::warp)
-        // =================================================================
-        "cuda_device::warp::lane_id" => Ok(Some(intrinsics::warp::emit_lane_id(
-            ctx,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::active_mask" => Ok(Some(intrinsics::warp::emit_active_mask(
-            ctx,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::sync_mask" => Ok(Some(intrinsics::warp::emit_warp_sync_mask(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-        )?)),
-        "cuda_device::warp::shuffle_sync" => Ok(Some(intrinsics::warp::emit_warp_shuffle_i32(
-            ctx,
-            body,
-            dialect_nvvm::ops::ShflSyncIdxI32Op::get_concrete_op_info(),
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::shuffle_up_sync" => Ok(Some(intrinsics::warp::emit_warp_shuffle_i32(
-            ctx,
-            body,
-            dialect_nvvm::ops::ShflSyncUpI32Op::get_concrete_op_info(),
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::shuffle_down_sync" => {
-            Ok(Some(intrinsics::warp::emit_warp_shuffle_i32(
+        "cuda_device::shared::__dynamic_shared_alignment" => {
+            // Zero-cost marker injected by #[launch_contract]. body.rs records
+            // the const alignment on the kernel; no runtime call survives.
+            let actual_prev_op = match prev_op {
+                Some(op) => op,
+                None => {
+                    let bool_ty = IntegerType::get(ctx, 1, Signedness::Signless);
+                    let dummy = Operation::new(
+                        ctx,
+                        MirConstantOp::get_concrete_op_info(),
+                        vec![bool_ty.into()],
+                        vec![],
+                        vec![],
+                        0,
+                    );
+                    dummy.deref_mut(ctx).set_loc(loc.clone());
+                    let const_op = MirConstantOp::new(dummy);
+                    use pliron::builtin::attributes::IntegerAttr;
+                    use pliron::utils::apint::APInt;
+                    use std::num::NonZeroUsize;
+                    let false_val = APInt::from_u64(0, NonZeroUsize::new(1).unwrap());
+                    const_op.set_attr_value(ctx, IntegerAttr::new(bool_ty, false_val));
+                    let dummy = const_op.get_operation();
+                    dummy.insert_at_front(block_ptr, ctx);
+                    dummy
+                }
+            };
+            Ok(Some(helpers::emit_goto(
                 ctx,
-                body,
-                dialect_nvvm::ops::ShflSyncDownI32Op::get_concrete_op_info(),
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
+                target.expect("__dynamic_shared_alignment must have target"),
+                actual_prev_op,
                 block_map,
                 loc,
-            )?))
+            )))
         }
-        "cuda_device::warp::shuffle_xor_sync" => Ok(Some(intrinsics::warp::emit_warp_shuffle_i32(
-            ctx,
-            body,
-            dialect_nvvm::ops::ShflSyncBflyI32Op::get_concrete_op_info(),
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::shuffle_f32_sync" => Ok(Some(intrinsics::warp::emit_warp_shuffle_f32(
-            ctx,
-            body,
-            dialect_nvvm::ops::ShflSyncIdxF32Op::get_concrete_op_info(),
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::shuffle_up_f32_sync" => {
-            Ok(Some(intrinsics::warp::emit_warp_shuffle_f32(
-                ctx,
-                body,
-                dialect_nvvm::ops::ShflSyncUpF32Op::get_concrete_op_info(),
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::warp::shuffle_down_f32_sync" => {
-            Ok(Some(intrinsics::warp::emit_warp_shuffle_f32(
-                ctx,
-                body,
-                dialect_nvvm::ops::ShflSyncDownF32Op::get_concrete_op_info(),
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::warp::shuffle_xor_f32_sync" => {
-            Ok(Some(intrinsics::warp::emit_warp_shuffle_f32(
-                ctx,
-                body,
-                dialect_nvvm::ops::ShflSyncBflyF32Op::get_concrete_op_info(),
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::warp::all_sync" => Ok(Some(intrinsics::warp::emit_warp_vote(
-            ctx,
-            body,
-            dialect_nvvm::ops::VoteSyncAllOp::get_concrete_op_info(),
-            false,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::any_sync" => Ok(Some(intrinsics::warp::emit_warp_vote(
-            ctx,
-            body,
-            dialect_nvvm::ops::VoteSyncAnyOp::get_concrete_op_info(),
-            false,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::ballot_sync" => Ok(Some(intrinsics::warp::emit_warp_vote(
-            ctx,
-            body,
-            dialect_nvvm::ops::VoteSyncBallotOp::get_concrete_op_info(),
-            true,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::match_any_sync" => Ok(Some(intrinsics::warp::emit_warp_match(
-            ctx,
-            body,
-            dialect_nvvm::ops::MatchAnySyncI32Op::get_concrete_op_info(),
-            false,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::match_any_i64_sync" => Ok(Some(intrinsics::warp::emit_warp_match(
-            ctx,
-            body,
-            dialect_nvvm::ops::MatchAnySyncI64Op::get_concrete_op_info(),
-            true,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::match_all_sync" => Ok(Some(intrinsics::warp::emit_warp_match(
-            ctx,
-            body,
-            dialect_nvvm::ops::MatchAllSyncI32Op::get_concrete_op_info(),
-            false,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-        "cuda_device::warp::match_all_i64_sync" => Ok(Some(intrinsics::warp::emit_warp_match(
-            ctx,
-            body,
-            dialect_nvvm::ops::MatchAllSyncI64Op::get_concrete_op_info(),
-            true,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
-
         // =================================================================
         // WGMMA (from intrinsics::wgmma)
         // =================================================================
-        "cuda_device::wgmma::wgmma_fence" => Ok(Some(intrinsics::wgmma::emit_wgmma_fence(
-            ctx, args, target, block_ptr, prev_op, block_map, loc,
-        )?)),
-        "cuda_device::wgmma::wgmma_commit_group" => {
-            Ok(Some(intrinsics::wgmma::emit_wgmma_commit_group(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?))
-        }
         "cuda_device::wgmma::make_smem_desc" => {
             Ok(Some(intrinsics::wgmma::emit_wgmma_make_smem_desc(
                 ctx,
@@ -2462,336 +3196,25 @@ fn try_dispatch_intrinsic(
                 ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
             )?))
         }
-
-        // =================================================================
-        // TMA (from intrinsics::tma)
-        // =================================================================
-        "cuda_device::tma::cp_async_bulk_tensor_1d_g2s" => Ok(Some(intrinsics::tma::emit_tma_g2s(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 1,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_2d_g2s" => Ok(Some(intrinsics::tma::emit_tma_g2s(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 2,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_2d_g2s_multicast" => {
-            Ok(Some(intrinsics::tma::emit_tma_g2s_multicast(
+        "cuda_device::wgmma::wgmma_mma_m64n128k16_f32_bf16" => {
+            Ok(Some(intrinsics::wgmma::emit_wgmma_mma_m64n128k16_f32_bf16(
                 ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
             )?))
         }
-        "cuda_device::tma::cp_async_bulk_tensor_2d_g2s_multicast_cg2" => {
-            Ok(Some(intrinsics::tma::emit_tma_g2s_multicast_cg2(
+        "cuda_device::wgmma::wgmma_mma_m64n64k16_f32_f16" => {
+            Ok(Some(intrinsics::wgmma::emit_wgmma_mma_m64n64k16_f32_f16(
                 ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
             )?))
         }
-        "cuda_device::tma::cp_async_bulk_tensor_3d_g2s" => Ok(Some(intrinsics::tma::emit_tma_g2s(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 3,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_4d_g2s" => Ok(Some(intrinsics::tma::emit_tma_g2s(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 4,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_5d_g2s" => Ok(Some(intrinsics::tma::emit_tma_g2s(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 5,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_1d_s2g" => Ok(Some(intrinsics::tma::emit_tma_s2g(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 1,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_2d_s2g" => Ok(Some(intrinsics::tma::emit_tma_s2g(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 2,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_3d_s2g" => Ok(Some(intrinsics::tma::emit_tma_s2g(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 3,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_4d_s2g" => Ok(Some(intrinsics::tma::emit_tma_s2g(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 4,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_tensor_5d_s2g" => Ok(Some(intrinsics::tma::emit_tma_s2g(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, 5,
-        )?)),
-        "cuda_device::tma::cp_async_bulk_commit_group" => {
-            Ok(Some(intrinsics::tma::emit_tma_commit_group(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?))
-        }
-        "cuda_device::tma::cp_async_bulk_wait_group" => {
-            Ok(Some(intrinsics::tma::emit_tma_wait_group(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, false,
-            )?))
-        }
-        "cuda_device::tma::cp_async_bulk_wait_group_read" => {
-            Ok(Some(intrinsics::tma::emit_tma_wait_group(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc, true,
-            )?))
-        }
-
-        // =================================================================
-        // Tcgen05 (from intrinsics::tcgen05)
-        // =================================================================
-        "cuda_device::tcgen05::tcgen05_alloc" => Ok(Some(intrinsics::tcgen05::emit_tcgen05_alloc(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-        )?)),
-        "cuda_device::tcgen05::tcgen05_dealloc" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_dealloc(
+        "cuda_device::wgmma::wgmma_mma_m64n64k8_f32_tf32" => {
+            Ok(Some(intrinsics::wgmma::emit_wgmma_mma_m64n64k8_f32_tf32(
                 ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_relinquish_alloc_permit" => Ok(Some(
-            intrinsics::tcgen05::emit_tcgen05_relinquish_alloc_permit(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?,
-        )),
-        "cuda_device::tcgen05::tcgen05_fence_before_thread_sync" => Ok(Some(
-            intrinsics::tcgen05::emit_tcgen05_fence_before_thread_sync(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?,
-        )),
-        "cuda_device::tcgen05::tcgen05_fence_after_thread_sync" => Ok(Some(
-            intrinsics::tcgen05::emit_tcgen05_fence_after_thread_sync(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?,
-        )),
-        "cuda_device::tcgen05::tcgen05_commit" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_commit(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_commit_shared_cluster" => Ok(Some(
-            intrinsics::tcgen05::emit_tcgen05_commit_shared_cluster(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?,
-        )),
-        // NOTE: tcgen05_make_smem_desc and tcgen05_make_smem_desc_strided removed
-        // Use Tcgen05SmemDescriptor::builder() in cuda-core instead
-        "cuda_device::tcgen05::tcgen05_mma_ws_f16" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_mma_ws_f16(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_mma_f16" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_mma_f16(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_mma_ws_bf16" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_mma_ws_bf16(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_mma_ws_tf32" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_mma_ws_tf32(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_cp_smem_to_tmem" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_cp_smem_to_tmem(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        // NOTE: tcgen05_st_tmem_to_smem* and tcgen05_ld_* (non-pure) removed
-        // Use tcgen05_ld_16x256b_pure or tcgen05_ld_16x256b_x8_pure instead
-        "cuda_device::tcgen05::tcgen05_ld_16x256b_x8_pure" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_ld_16x256b_x8_pure(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_ld_16x256b_pure" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_ld_16x256b_pure(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_load_wait" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_load_wait(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_store_wait" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_store_wait(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?))
-        }
-
-        // CTA pair (cta_group::2) variants
-        "cuda_device::tcgen05::tcgen05_alloc_cg2" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_alloc_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_dealloc_cg2" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_dealloc_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_relinquish_alloc_permit_cg2" => Ok(Some(
-            intrinsics::tcgen05::emit_tcgen05_relinquish_alloc_permit_cg2(
-                ctx, args, target, block_ptr, prev_op, block_map, loc,
-            )?,
-        )),
-        "cuda_device::tcgen05::tcgen05_mma_f16_cg2" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_mma_f16_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_commit_cg2" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_commit_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::tcgen05_commit_shared_cluster_cg2" => Ok(Some(
-            intrinsics::tcgen05::emit_tcgen05_commit_shared_cluster_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?,
-        )),
-        "cuda_device::tcgen05::tcgen05_commit_multicast_cg2" => Ok(Some(
-            intrinsics::tcgen05::emit_tcgen05_commit_multicast_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?,
-        )),
-        "cuda_device::tcgen05::tcgen05_cp_smem_to_tmem_cg2" => {
-            Ok(Some(intrinsics::tcgen05::emit_tcgen05_cp_smem_to_tmem_cg2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-
-        // =================================================================
-        // Memory Operations (from intrinsics::memory)
-        // Note: stmatrix and cvt are under cuda_device::tcgen05::
-        // =================================================================
-        "cuda_device::tcgen05::stmatrix_m8n8_x4" => {
-            Ok(Some(intrinsics::memory::emit_stmatrix_m8n8_x4(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::stmatrix_m8n8_x4_trans" => {
-            Ok(Some(intrinsics::memory::emit_stmatrix_m8n8_x4_trans(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::stmatrix_m8n8_x2" => {
-            Ok(Some(intrinsics::memory::emit_stmatrix_m8n8_x2(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::stmatrix_m8n8_x2_trans" => {
-            Ok(Some(intrinsics::memory::emit_stmatrix_m8n8_x2_trans(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::tcgen05::cvt_f32x2_bf16x2" => {
-            Ok(Some(intrinsics::memory::emit_cvt_f32x2_bf16x2(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-
-        // =================================================================
-        // CLC - Cluster Launch Control (from intrinsics::clc)
-        // =================================================================
-        "cuda_device::clc::clc_try_cancel" => Ok(Some(intrinsics::clc::emit_clc_try_cancel(
-            ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-        )?)),
-        "cuda_device::clc::clc_try_cancel_multicast" => {
-            Ok(Some(intrinsics::clc::emit_clc_try_cancel_multicast(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-        "cuda_device::clc::clc_query_is_canceled" => {
-            Ok(Some(intrinsics::clc::emit_clc_query_is_canceled(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::clc::clc_query_get_first_ctaid_x" => {
-            Ok(Some(intrinsics::clc::emit_clc_query_get_first_ctaid_x(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::clc::clc_query_get_first_ctaid_y" => {
-            Ok(Some(intrinsics::clc::emit_clc_query_get_first_ctaid_y(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "cuda_device::clc::clc_query_get_first_ctaid_z" => {
-            Ok(Some(intrinsics::clc::emit_clc_query_get_first_ctaid_z(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
             )?))
         }
 
         // =================================================================
         // DisjointSlice and SharedArray operations
         // =================================================================
-        "cuda_device::DisjointSlice::get_thread_local" => {
-            Ok(Some(intrinsics::indexing::emit_get_thread_local(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
         "cuda_device::DisjointSlice::len" => Ok(Some(intrinsics::indexing::emit_len(
             ctx,
             body,
@@ -2805,11 +3228,9 @@ fn try_dispatch_intrinsic(
             loc,
         )?)),
 
-        // Trait method - check substs for SharedArray
+        // Trait method - check the substs' Self type for SharedArray
         // Note: Index/IndexMut can appear as either std::ops or core::ops
-        "std::ops::IndexMut::index_mut" | "core::ops::IndexMut::index_mut"
-            if substs_contains("SharedArray") =>
-        {
+        "std::ops::IndexMut::index_mut" | "core::ops::IndexMut::index_mut" if on_shared_array => {
             Ok(Some(intrinsics::memory::emit_shared_array_index(
                 ctx,
                 body,
@@ -2824,7 +3245,7 @@ fn try_dispatch_intrinsic(
                 true,
             )?))
         }
-        "std::ops::Index::index" | "core::ops::Index::index" if substs_contains("SharedArray") => {
+        "std::ops::Index::index" | "core::ops::Index::index" if on_shared_array => {
             Ok(Some(intrinsics::memory::emit_shared_array_index(
                 ctx,
                 body,
@@ -2840,40 +3261,15 @@ fn try_dispatch_intrinsic(
             )?))
         }
 
-        // =================================================================
-        // Prefix-based matches (for const generics like wgmma_wait_group::<N>)
-        // =================================================================
-        path if path.starts_with("cuda_device::wgmma::wgmma_wait_group") => {
-            // Extract N from path like "cuda_device::wgmma::wgmma_wait_group::<0>"
-            let n = path
-                .split("::<")
-                .nth(1)
-                .and_then(|s| s.strip_suffix('>'))
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-            Ok(Some(intrinsics::wgmma::emit_wgmma_wait_group(
-                ctx, args, target, block_ptr, prev_op, block_map, loc, n,
-            )?))
-        }
-
-        // DisjointSlice methods using prefix matching
+        // DisjointSlice methods using prefix matching (covers generic
+        // instantiations whose full path includes type parameters).
+        // Note: `get_mut` and `get_unchecked_mut` are `#[inline]` in
+        // cuda-device and are always inlined by rustc before MIR reaches the
+        // translator, so element access never surfaces here as a call. Only
+        // `len` needs a dispatch arm.
         path if path.starts_with("cuda_device::DisjointSlice::") => {
             if let Some(method) = path.rsplit("::").next() {
                 match method {
-                    "get_mut" | "get_unchecked_mut" | "get_thread_local" => {
-                        Ok(Some(intrinsics::indexing::emit_get_thread_local(
-                            ctx,
-                            body,
-                            args,
-                            destination,
-                            target,
-                            block_ptr,
-                            prev_op,
-                            value_map,
-                            block_map,
-                            loc,
-                        )?))
-                    }
                     "len" => Ok(Some(intrinsics::indexing::emit_len(
                         ctx,
                         body,
@@ -2893,9 +3289,10 @@ fn try_dispatch_intrinsic(
             }
         }
 
-        // SharedArray::as_ptr and as_mut_ptr - convert shared memory pointer to generic
-        path if path.contains("SharedArray") && path.contains("as_ptr") => {
-            Ok(Some(intrinsics::memory::emit_shared_array_as_ptr(
+        // Explicit generic-to-shared address conversion for hardware SMEM
+        // descriptors (the CUDA C++ `__cvta_generic_to_shared_offset` analog).
+        "cuda_device::shared::cvta_generic_to_shared_offset" => Ok(Some(
+            intrinsics::memory::emit_cvta_generic_to_shared_offset(
                 ctx,
                 body,
                 args,
@@ -2906,9 +3303,29 @@ fn try_dispatch_intrinsic(
                 value_map,
                 block_map,
                 loc,
-            )?))
-        }
-        path if path.contains("SharedArray") && path.contains("as_mut_ptr") => {
+                64,
+            )?,
+        )),
+        "cuda_device::shared::cvta_generic_to_shared_u32" => Ok(Some(
+            intrinsics::memory::emit_cvta_generic_to_shared_offset(
+                ctx,
+                body,
+                args,
+                destination,
+                target,
+                block_ptr,
+                prev_op,
+                value_map,
+                block_map,
+                loc,
+                32,
+            )?,
+        )),
+
+        // Public SharedArray pointer conversions all narrow the shared-memory
+        // base to a generic pointer. Recognition is shared with destination
+        // address-space classification in translator::values.
+        path if super::shared_array_pointer_method(path).is_some() => {
             Ok(Some(intrinsics::memory::emit_shared_array_as_ptr(
                 ctx,
                 body,
@@ -2946,5 +3363,139 @@ fn try_dispatch_intrinsic(
 
         // Not an intrinsic
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn foreign_signature_rejects_c_variadic_before_claiming_an_exact_abi() {
+        assert!(ensure_foreign_callee_is_not_variadic("fixed", false).is_ok());
+        assert!(ensure_foreign_callee_is_not_variadic("variadic", true).is_err());
+    }
+
+    #[test]
+    fn generated_kernel_setup_calls_have_no_user_debug_location() {
+        let user_location = Location::Named {
+            name: "kernel attribute".into(),
+            child_loc: Box::new(Location::Unknown),
+        };
+
+        for constructor in KERNEL_SCOPE_CONSTRUCTORS {
+            assert_eq!(
+                call_debug_location(Some(constructor), user_location.clone()),
+                llvm_export::artificial_debug_location()
+            );
+        }
+        assert_eq!(
+            call_debug_location(
+                Some("cuda_device::__launch_bounds_config"),
+                user_location.clone()
+            ),
+            llvm_export::artificial_debug_location(),
+            "zero-cost launch metadata must not leave an attribute line behind"
+        );
+        assert_eq!(
+            call_debug_location(
+                Some("cuda_device::thread::__internal::index_1d"),
+                user_location.clone()
+            ),
+            user_location,
+            "user-written indexing calls keep their source locations"
+        );
+    }
+
+    /// A `SwitchInt` arm keeps its whole value at 128 bits, and narrower
+    /// discriminants truncate exactly as the previous `u64` construction did.
+    /// Every width at or below 64 is the behaviour this shares with the enum
+    /// tags that dominate the switches in the tree, so it is pinned here
+    /// alongside the widths that used to be rejected.
+    #[test]
+    fn switch_arm_constants_are_built_at_the_discriminant_width() {
+        use pliron::utils::apint::APInt;
+        use std::num::NonZeroUsize;
+
+        let ctx = &mut Context::new();
+
+        for (width, value) in [
+            (8usize, 0xffu128),
+            (16, 0xbeef),
+            (32, 0xdead_beef),
+            (64, u128::from(u64::MAX)),
+        ] {
+            let attr = switch_arm_constant(ctx, value, width, Signedness::Unsigned);
+            let expected = APInt::from_u64(value as u64, NonZeroUsize::new(width).unwrap());
+            assert_eq!(
+                attr.value(),
+                expected,
+                "width {width} must match the previous u64 construction"
+            );
+        }
+
+        // Above 64 bits the u64 construction could not represent the value at
+        // all, which is what used to be rejected.
+        let wide = (1u128 << 100) | 1;
+        let attr = switch_arm_constant(ctx, wide, 128, Signedness::Unsigned);
+        assert_eq!(attr.value().to_u128(), wide);
+        assert_eq!(attr.value().bw(), 128);
+    }
+
+    /// The importer traps exactly the calls the codegen collector declines to
+    /// collect. If the two predicates drift apart, one side emits a call to a
+    /// symbol the other never defines.
+    #[test]
+    fn panic_entry_paths_agree_with_the_collector_predicate() {
+        assert!(is_panic_entry_path("core::panicking::panic"));
+        assert!(is_panic_entry_path("core::panicking::panic_fmt"));
+        assert!(is_panic_entry_path("core::panicking::panic_bounds_check"));
+        assert!(is_panic_entry_path("std::rt::panic_fmt"));
+
+        assert!(!is_panic_entry_path(
+            "core::slice::<impl [T]>::split_at_mut"
+        ));
+        assert!(!is_panic_entry_path("my_crate::panic_helper"));
+        assert!(!is_panic_entry_path("my_crate::panicking_but_mine"));
+    }
+
+    /// A dropped panic call must leave `nvvm.trap` (carrying its ABI marker,
+    /// or the target-requirements verifier rejects it) followed by
+    /// `mir.unreachable`, and nothing else: the message-building statements
+    /// the call would have consumed are never translated.
+    #[test]
+    fn dropped_panic_block_lowers_to_marked_trap_then_unreachable() {
+        use dialect_mir::ops::MirUnreachableOp;
+        use pliron::builtin::attributes::StringAttr;
+        use pliron::identifier::Identifier;
+
+        let mut ctx = Context::new();
+        crate::translator::register_dialects(&mut ctx);
+
+        let block_ptr = BasicBlock::new(&mut ctx, None, vec![]);
+        emit_trap_unreachable_after(&mut ctx, block_ptr, None, Location::Unknown);
+
+        let ops: Vec<Ptr<Operation>> = block_ptr.deref(&ctx).iter(&ctx).collect();
+        assert_eq!(
+            ops.len(),
+            2,
+            "a dropped panic block holds trap + unreachable"
+        );
+        let trap = Operation::get_op::<dialect_nvvm::ops::TrapOp>(ops[0], &ctx)
+            .expect("first op is `nvvm.trap`");
+        assert!(
+            Operation::get_op::<MirUnreachableOp>(ops[1], &ctx).is_some(),
+            "second op is `mir.unreachable`"
+        );
+
+        let marker_key =
+            Identifier::try_from(cuda_oxide_codegen::__private::GENERATED_INTRINSIC_MARKER_ATTR)
+                .unwrap();
+        let trap_ref = trap.get_operation().deref(&ctx);
+        let marker: &StringAttr = trap_ref
+            .attributes
+            .get(&marker_key)
+            .expect("`nvvm.trap` carries its generated-intrinsic ABI marker");
+        assert_eq!(String::from(marker.clone()), "v1:i0295");
     }
 }

@@ -41,7 +41,7 @@ CUDA provides built-in variables (`threadIdx`, `blockIdx`, `blockDim`,
 `gridDim`); cuda-oxide wraps these in the `cuda_device::thread` module:
 
 ```rust
-use cuda_device::{kernel, thread, DisjointSlice};
+use cuda_device::{DisjointSlice, kernel, thread};
 
 #[kernel]
 pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
@@ -52,9 +52,10 @@ pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
 }
 ```
 
-`thread::index_1d()` computes `blockIdx.x * blockDim.x + threadIdx.x` -- the
-global flat index that maps each thread to exactly one array element. This is the
-common case for 1D data-parallel kernels.
+`thread::index_1d()` computes `blockIdx.x * blockDim.x + threadIdx.x`. It maps
+threads to distinct array elements when grid and block Y/Z dimensions are 1.
+That is the common shape for 1D data-parallel kernels; a `domain = 1` prepared
+launch proves it.
 
 For cases where you need individual components, cuda-oxide exposes the raw
 accessors:
@@ -159,7 +160,7 @@ for architecture-specific SM resource limits and occupancy calculations.
 On the host side, `LaunchConfig` tells the runtime how to shape the grid:
 
 ```rust
-use cuda_core::LaunchConfig;
+use cuda_core::simt::LaunchConfig;
 
 // Quick 1D launch: 256 threads per block, enough blocks to cover N elements
 let cfg = LaunchConfig::for_num_elems(N as u32);
@@ -177,20 +178,36 @@ let cfg = LaunchConfig {
 };
 ```
 
-Then pass it to the generated launch method:
+Then pass it to the generated raw launch method. The call is unsafe because
+`LaunchConfig` itself does not prove that hidden Y/Z dimensions are inactive:
 
 ```rust
-module
-    .vecadd(&stream, LaunchConfig::for_num_elems(N as u32), &a_dev, &b_dev, &mut c_dev)
-    .expect("Kernel launch failed");
+// SAFETY: `for_num_elems` is 1D and all three buffers contain N elements.
+unsafe {
+    module.vecadd(
+        &stream,
+        LaunchConfig::for_num_elems(N as u32),
+        &a_dev,
+        &b_dev,
+        &mut c_dev,
+    )
+}
+.expect("Kernel launch failed");
 ```
 
 Or with the async API:
 
 ```rust
-module
-    .vecadd_async(LaunchConfig::for_num_elems(N as u32), &a_dev, &b_dev, &mut c_dev)?
-    .sync()?;
+// SAFETY: this is 1D, buffers contain N elements, and module/scheduler share a context.
+unsafe {
+    module.vecadd_async(
+        LaunchConfig::for_num_elems(N as u32),
+        &a_dev,
+        &b_dev,
+        &mut c_dev,
+    )
+}?
+.sync()?;
 ```
 
 (execution-choosing-block-size)=

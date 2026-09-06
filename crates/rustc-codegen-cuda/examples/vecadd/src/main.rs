@@ -20,7 +20,8 @@
 
 // No #![cfg_attr(cuda_device, no_std)] - this compiles as ONE unit!
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::simt::LaunchConfig;
+use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
 // =============================================================================
@@ -73,15 +74,17 @@ fn main() {
 
     // Load the embedded PTX bundle and launch through the typed module API.
     let module = kernels::load(&ctx).expect("Failed to load embedded CUDA module");
-    module
-        .vecadd(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.vecadd(
             &stream,
             LaunchConfig::for_num_elems(N as u32),
             &a_dev,
             &b_dev,
             &mut c_dev,
         )
-        .expect("Kernel launch failed");
+    }
+    .expect("Kernel launch failed");
 
     // Get results
     let c_host = c_dev.to_host_vec(&stream).unwrap();

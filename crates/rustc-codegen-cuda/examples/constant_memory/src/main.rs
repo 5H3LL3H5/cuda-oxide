@@ -14,7 +14,8 @@
 //! Build and run with:
 //!   cargo oxide run constant_memory
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::simt::LaunchConfig;
+use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_device::{ConstantMemory, DisjointSlice, constant, cuda_module, kernel, thread};
 
 #[cuda_module]
@@ -73,11 +74,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // set + launch on the same stream → naturally ordered. The second
         // launch demonstrates that re-setting between launches is observed.
         module.set_coeffs(&stream, &coeffs)?;
-        module.apply(
-            &stream,
-            LaunchConfig::for_num_elems(N as u32),
-            &mut output_dev,
-        )?;
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.apply(
+                &stream,
+                LaunchConfig::for_num_elems(N as u32),
+                &mut output_dev,
+            )
+        }?;
         verify(label, &output_dev.to_host_vec(&stream)?, &coeffs);
     }
 

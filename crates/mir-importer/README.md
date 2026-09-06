@@ -1,39 +1,34 @@
 # mir-importer
 
-Rust MIR to `dialect-mir` translator and compilation pipeline for cuda-oxide.
+Rust MIR to `dialect-mir` translator for cuda-oxide.
 
 Translates rustc's Stable MIR into [`dialect-mir`](../dialect-mir/) (a pliron
-dialect, MLIR-like) using the alloca + load/store model, then orchestrates the
-rest of the pipeline through `mem2reg`, lowering to
-[`dialect-llvm`](../dialect-llvm/), LLVM IR export, and PTX generation via `llc`.
+dialect, MLIR-like) using the alloca + load/store model, then calls the shared
+`cuda-oxide-codegen` backend for preparation, lowering, export, and PTX or NVVM
+IR generation.
 
 ## Architecture
 
 ```text
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           mir-importer                                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ┌─────────────────┐    ┌─────────────────────┐    ┌─────────────────┐  │
-│  │   translator    │───▶│       pipeline      │───▶│    export +     │  │
-│  │                 │    │                     │    │      llc        │  │
-│  │  MIR →          │    │ mem2reg + lower to  │    │  LLVM IR → PTX  │  │
-│  │  dialect-mir    │    │     dialect-llvm    │    │                 │  │
-│  │     (alloca)    │    │   (via mir-lower)   │    │                 │  │
-│  └─────────────────┘    └─────────────────────┘    └─────────────────┘  │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+┌────────────── mir-importer ──────────────┐
+│ Stable MIR ──▶ dialect-mir translation  │
+└────────────────────┬─────────────────────┘
+                     │ translated module
+                     ▼
+┌────────── cuda-oxide-codegen ────────────┐
+│ verify ─▶ mem2reg/unroll ─▶ lower       │
+│        ─▶ LLVM export ─▶ PTX/NVVM IR    │
+└──────────────────────────────────────────┘
 ```
 
 ## Pipeline Steps
 
 ```text
-┌────────────┐  ┌────────────┐  ┌───────────┐  ┌─────────────────┐  ┌────────────┐
-│ 1. Trans-  │─▶│ 2. Verify  │─▶│ 3. mem2reg│─▶│ 4. Lower        │─▶│ 5. Export  │
-│   late to  │  │ dialect-mir│  │   (slots  │  │  dialect-mir →  │  │  LLVM IR   │
-│ dialect-mir│  │            │  │    → SSA) │  │   dialect-llvm  │  │ → PTX (llc)│
-└────────────┘  └────────────┘  └───────────┘  └─────────────────┘  └────────────┘
+translate → verify → mem2reg → annotated unroll → lower/export → optimize → PTX
 ```
+
+Full variable-debug builds skip `mem2reg` and annotated unrolling so source
+variables remain in stable memory locations for cuda-gdb.
 
 1. **Translate** — Convert Stable MIR into `dialect-mir` using the alloca +
    load/store model (one `mir.alloca` per non-ZST local).
@@ -42,9 +37,25 @@ rest of the pipeline through `mem2reg`, lowering to
 3. **mem2reg** — Promote scalar alloca slots back to SSA via
    `pliron::opts::mem2reg`, eliminating the load/store traffic the translator
    produced.
-4. **Lower** — Convert `dialect-mir` → `dialect-llvm` (via `mir-lower`).
-5. **Generate** — Export `dialect-llvm` to textual LLVM IR, then invoke `llc`
-   for PTX (or emit NVVM IR).
+4. **Unroll** — Apply supported `#[unroll]` and `#[unroll(N)]` requests to the
+   SSA form.
+5. **Lower and export** — Convert `dialect-mir` → LLVM dialect (via `mir-lower`)
+   and export LLVM IR. By default, ordinary float operations carry the
+   `contract` fast-math flag so NVPTX can fuse `fmul+fadd` into `fma.rn.f32`
+   (matching nvcc's `--fmad=true`). `--no-fmad` omits that permission.
+6. **Optimize** — Run `opt -O2` (via `LlvmToolchain`) on the exported IR.
+   Skipped for full-debug builds (`-G`) so locals stay inspectable under
+   cuda-gdb. Override with `CUDA_OXIDE_NO_OPT=1`.
+7. **Generate** — Invoke `llc -fp-contract=fast` for PTX (or emit NVVM IR).
+   The `-fp-contract=fast` flag activates the NVPTX backend's FMA contract
+   mode; pair with the IR `contract` flag from step 5. Disable both gates with
+   `CUDA_OXIDE_NO_FMA=1` or `cargo oxide run --no-fmad`. Explicit fused
+   operations such as `f32::mul_add` remain fused.
+
+NVVM IR and LTOIR defer final code generation. Their versioned `.target` file
+requires the sibling `.options` file, which tells cuda-host, libNVVM, and
+nvJitLink whether to use `-fma=0` or `-fma=1`. Copy both sidecars with the
+artifact; a missing required sidecar is an error rather than a silent fallback.
 
 ## Output Modes
 
@@ -66,30 +77,44 @@ rest of the pipeline through `mem2reg`, lowering to
 | `rvalue`    | Expression translation (binops, casts, etc.)   |
 | `types`     | Rust type → `dialect-mir` type conversion      |
 | `values`    | MIR local → alloca-slot mapping + load/store   |
+| `layout`    | Shared readers over rustc's aggregate layout   |
+| `location`  | Source-location helpers for MIR translation    |
+| `payload_store` | Enum-payload stores whose storage type differs from its usage |
 
-### `terminator/intrinsics/` — GPU Intrinsics
+### `terminator/intrinsics/` — intrinsic handlers
 
-| Module     | Intrinsics                                         | GPU       |
-|------------|----------------------------------------------------|-----------|
-| `indexing` | `threadIdx`, `blockIdx`, `blockDim`, `gridDim`,    | All       |
-|            | `index_1d`/`index_2d`, DisjointSlice helpers       |           |
-| `sync`     | `sync_threads`, mbarrier ops, fences               | All       |
-| `warp`     | Shuffle operations, `lane_id`, warp vote           | All       |
-| `atomic`   | Scoped GPU atomics, `core::sync::atomic` support   | sm_70+    |
-| `memory`   | Shared memory, address space casts, stmatrix       | All       |
-| `debug`    | `vprintf`, clock, trap, breakpoint                 | All       |
-| `cluster`  | Thread Block Clusters, DSMEM                       | sm_90+    |
-| `tma`      | Tensor Memory Accelerator bulk copies              | sm_90+    |
-| `wgmma`    | Warpgroup MMA                                      | sm_90     |
-| `tcgen05`  | 5th-gen Tensor Cores, TMEM                         | sm_100+   |
-| `clc`      | Cluster Launch Control                             | sm_100+   |
+Anything `intrinsics/catalog.json` describes is dispatched by `generated`;
+the modules beside it hold the cases the catalog does not cover. One row per
+file:
+
+| Module        | Purpose (from each module's own doc comment)                                |
+|---------------|-----------------------------------------------------------------------------|
+| `asm`         | Inline PTX marker-call translation                                          |
+| `atomic`      | Atomic operation intrinsic handlers                                         |
+| `bigint`      | Rust compiler bigint helper intrinsics                                      |
+| `bitops`      | Rust compiler bit-manipulation intrinsics                                   |
+| `debug`       | Debug and profiling intrinsics                                              |
+| `exact_div`   | Rust compiler `exact_div` intrinsic                                         |
+| `float_math`  | Rust compiler floating-point math intrinsics                                |
+| `generated`   | Generated raw/compatibility path dispatch for CUDA intrinsics               |
+| `iket`        | Translation of `cuda_device::iket` compiler markers                         |
+| `indexing`    | Thread and block indexing intrinsics                                        |
+| `layout`      | Rust dynamic-layout intrinsics for slices, `str`, and slice-tailed structs  |
+| `memory`      | Memory access and conversion intrinsics                                     |
+| `saturating`  | Rust compiler saturating integer intrinsics                                 |
+| `tma`         | Tensor Memory Accelerator (TMA) intrinsics                                  |
+| `wgmma`       | Hopper WGMMA (Warpgroup Matrix Multiply-Accumulate) intrinsics              |
+
+Per-intrinsic PTX and minimum-SM requirements live in the catalog and are
+rendered into `intrinsics/generated-reference.md`, so they are not restated
+here.
 
 ### `pipeline.rs` — Compilation Orchestration
 
-Drives the end-to-end flow: register dialects → translate functions →
-verify `dialect-mir` → run `mem2reg` → lower to `dialect-llvm` → add
-device extern declarations → verify `dialect-llvm` → export LLVM IR →
-run `llc` for PTX.
+Registers dialects and translates functions, then calls the single
+`cuda-oxide-codegen` backend orchestrator. That backend owns verification,
+`mem2reg`, unrolling, device extern insertion, lowering, LLVM IR export, and
+optional `llc` PTX generation.
 
 ## Alloca + load/store model
 
@@ -98,7 +123,7 @@ through block arguments via a liveness analysis, the translator emits one
 `mir.alloca` per non-ZST local at the top of the entry block and mediates
 every def/use through `mir.store` / `mir.load` on that slot. Pliron's
 `mem2reg` pass promotes the allocas back to SSA before the `dialect-mir` →
-`dialect-llvm` lowering runs.
+LLVM dialect lowering runs.
 
 ```text
 Rust MIR (not strict SSA):               dialect-mir (alloca + load/store):
@@ -149,14 +174,27 @@ let result = run_pipeline(&functions, &device_externs, &config)?;
 
 ### Error Types
 
+`PipelineError` is defined in `cuda-oxide-codegen` and re-exported here
+(`pipeline.rs`), so this is the full set of variants `run_pipeline` can
+return. The crate's own `TranslationErr` (`error.rs`) is the narrower
+per-function error the translator raises: `Unsupported`, `TypeError` and
+`InvalidOp`.
+
+
 | Variant          | When                                             |
 |------------------|--------------------------------------------------|
 | `NoBody`         | Function has no MIR body                         |
 | `Translation`    | MIR → `dialect-mir` conversion failed            |
 | `Verification`   | IR invariant violated (includes op context)      |
-| `Lowering`       | `dialect-mir` → `dialect-llvm` pass failed       |
+| `Lowering`       | `dialect-mir` → LLVM dialect pass failed         |
+| `LoweredVerification` | Lowered LLVM-dialect invariant failed       |
 | `Export`         | LLVM IR export failed                            |
 | `PtxGeneration`  | `llc` invocation failed                          |
+| `Optimization`   | `opt` invocation failed                          |
+| `TargetSelection` | No target satisfied the module's requirements   |
+| `UnsupportedLinking` | Device symbols could not be linked           |
+| `LibdeviceUnavailable` | libdevice was needed but not found         |
+| `InvalidMirPassPipeline` | `CUDA_OXIDE_MIR_PASSES` named an unknown pass |
 
 ## Translation Flow
 
@@ -171,21 +209,18 @@ run_pipeline()
   │                       ├─▶ statement::translate_statement()
   │                       │     └─▶ rvalue::translate_rvalue()
   │                       └─▶ terminator::translate_terminator()
-  ├─▶ verify dialect-mir module
-  ├─▶ run pliron::opts::mem2reg (alloca slots → SSA)
-  ├─▶ lower_mir_to_llvm (mir-lower, DialectConversion)
-  ├─▶ add DeviceExternDecl functions
-  ├─▶ verify dialect-llvm module
-  └─▶ export LLVM IR → generate PTX via llc
+  └─▶ cuda-oxide-codegen shared backend
+        └─▶ verify → prepare → externs → lower → export → PTX/NVVM IR
 ```
 
 ## Dependencies
 
+- [cuda-oxide-codegen](../cuda-oxide-codegen/) — shared post-translation backend
 - [pliron](https://github.com/vaivaswatha/pliron) — Pliron IR (MLIR-like) framework
 - [dialect-mir](../dialect-mir/) — pliron dialect modelling Rust MIR
-- [dialect-llvm](../dialect-llvm/) — pliron dialect modelling LLVM IR
+- [llvm-export](../llvm-export/) — pliron-llvm shim + textual `.ll` exporter
 - [dialect-nvvm](../dialect-nvvm/) — NVVM intrinsic ops
-- [mir-lower](../mir-lower/) — `dialect-mir` → `dialect-llvm` lowering pass
+- [mir-lower](../mir-lower/) — `dialect-mir` → LLVM dialect lowering pass
 
 ## Further Reading
 

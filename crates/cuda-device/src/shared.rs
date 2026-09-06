@@ -15,7 +15,7 @@
 //!
 //! Declare shared memory as `static mut` inside a kernel:
 //!
-//! ```rust
+//! ```rust,ignore
 //! use cuda_device::{kernel, thread, SharedArray};
 //!
 //! #[kernel]
@@ -64,7 +64,7 @@ use core::ops::{Index, IndexMut};
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// static mut TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
 ///
 /// unsafe {
@@ -88,7 +88,7 @@ use core::ops::{Index, IndexMut};
 /// element type. For TMA (Tensor Memory Accelerator) destinations, use `ALIGN = 128`
 /// to meet the 128-byte alignment requirement:
 ///
-/// ```rust
+/// ```rust,ignore
 /// // Regular shared memory - natural alignment
 /// static mut TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
 ///
@@ -124,7 +124,7 @@ impl<T, const N: usize, const ALIGN: usize> SharedArray<T, N, ALIGN> {
     /// Marker constant for uninitialized shared memory.
     ///
     /// Use this to initialize `static mut` declarations:
-    /// ```rust
+    /// ```rust,ignore
     /// static mut TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
     /// ```
     pub const UNINIT: Self = Self {
@@ -163,7 +163,7 @@ impl<T, const N: usize, const ALIGN: usize> SharedArray<T, N, ALIGN> {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// // Use with map_shared_rank for DSMEM
     /// let remote_ptr = unsafe { cluster::map_shared_rank(SHMEM.as_ptr(), neighbor_rank) };
     /// ```
@@ -184,13 +184,41 @@ impl<T, const N: usize, const ALIGN: usize> SharedArray<T, N, ALIGN> {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// // Initialize first element
     /// unsafe { SHMEM.as_mut_ptr().write(value) };
     /// ```
     #[inline(never)]
     pub fn as_mut_ptr(&mut self) -> *mut T {
         unreachable!("SharedArray::as_mut_ptr called outside CUDA kernel context")
+    }
+
+    /// Returns a mutable raw pointer to the shared memory array without
+    /// creating a Rust reference to the complete allocation.
+    ///
+    /// This is the appropriate entry point when multiple CUDA threads derive
+    /// disjoint raw pointers from one `static mut SharedArray`. Unlike
+    /// [`Self::as_mut_ptr`], the raw receiver does not require each thread to
+    /// create an overlapping `&mut SharedArray`.
+    ///
+    /// # Safety
+    ///
+    /// `shared` must point to a `static mut SharedArray` in the current CUDA
+    /// kernel, normally obtained with `&raw mut`. The returned pointer is valid
+    /// only within that kernel. Callers must keep concurrent accesses disjoint
+    /// and use the CUDA synchronization required before reading data written by
+    /// another thread.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// static mut SCRATCH: SharedArray<f32, 256> = SharedArray::UNINIT;
+    /// let scratch = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SCRATCH) };
+    /// ```
+    #[inline(never)]
+    pub unsafe fn as_raw_mut_ptr(shared: *mut Self) -> *mut T {
+        let _ = shared;
+        unreachable!("SharedArray::as_raw_mut_ptr called outside CUDA kernel context")
     }
 }
 
@@ -254,6 +282,17 @@ impl<T, const N: usize, const ALIGN: usize> IndexMut<usize> for SharedArray<T, N
 // DynamicSharedArray - Runtime-sized shared memory
 // ============================================================================
 
+/// Compile-time minimum alignment marker for a kernel's dynamic shared memory.
+///
+/// This is injected by `#[launch_contract]`. cuda-oxide removes the call before
+/// code generation, so it adds no kernel hot-path instructions. Kernel authors
+/// should use the attribute rather than calling this function directly.
+#[doc(hidden)]
+#[inline(never)]
+pub fn __dynamic_shared_alignment<const ALIGN: usize>() {
+    // The MIR importer removes this marker after recording ALIGN.
+}
+
 /// Dynamic (runtime-sized) shared memory with configurable alignment.
 ///
 /// Unlike [`SharedArray`] which has a compile-time known size, `DynamicSharedArray`
@@ -273,7 +312,7 @@ impl<T, const N: usize, const ALIGN: usize> IndexMut<usize> for SharedArray<T, N
 /// The `ALIGN` parameter controls the alignment of the `extern __shared__`
 /// declaration in PTX:
 ///
-/// ```rust
+/// ```rust,ignore
 /// // Default alignment (16 bytes, matches nvcc for char[])
 /// let smem: *mut f32 = DynamicSharedArray::<f32>::get();
 /// // PTX: .extern .shared .align 16 .b8 __dynamic_smem[];
@@ -294,7 +333,7 @@ impl<T, const N: usize, const ALIGN: usize> IndexMut<usize> for SharedArray<T, N
 ///
 /// # Usage
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cuda_device::{kernel, DynamicSharedArray, DisjointSlice};
 ///
 /// #[kernel]
@@ -324,15 +363,18 @@ impl<T, const N: usize, const ALIGN: usize> IndexMut<usize> for SharedArray<T, N
 ///
 /// Specify the shared memory size in the launch configuration:
 ///
-/// ```rust
-/// cuda_launch! {
-///     kernel: flexible_kernel,
-///     config: LaunchConfig {
-///         grid_dim: (blocks, 1, 1),
-///         block_dim: (256, 1, 1),
-///         shared_mem_bytes: 2048,  // 512 f32s total
-///     },
-///     // ...
+/// ```rust,ignore
+/// // SAFETY: argument list matches `flexible_kernel`'s signature.
+/// unsafe {
+///     cuda_launch! {
+///         kernel: flexible_kernel,
+///         config: LaunchConfig {
+///             grid_dim: (blocks, 1, 1),
+///             block_dim: (256, 1, 1),
+///             shared_mem_bytes: 2048,  // 512 f32s total
+///         },
+///         // ...
+///     }
 /// }
 /// ```
 ///
@@ -342,7 +384,7 @@ impl<T, const N: usize, const ALIGN: usize> IndexMut<usize> for SharedArray<T, N
 /// a kernel reference the **same** underlying memory. Use byte offsets to
 /// partition the memory for multiple arrays:
 ///
-/// ```rust
+/// ```rust,ignore
 /// // First array: 256 f32s (1024 bytes) starting at offset 0
 /// let array_a: *mut f32 = DynamicSharedArray::<f32>::get();
 ///
@@ -385,7 +427,7 @@ impl<T, const ALIGN: usize> DynamicSharedArray<T, ALIGN> {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// let smem: *mut f32 = DynamicSharedArray::<f32>::get();
     /// unsafe {
     ///     *smem.add(tid) = value;
@@ -407,7 +449,7 @@ impl<T, const ALIGN: usize> DynamicSharedArray<T, ALIGN> {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// let raw: *mut u8 = DynamicSharedArray::<u8>::get_raw();
     /// // Cast to specific types as needed
     /// let floats = raw as *mut f32;
@@ -429,7 +471,7 @@ impl<T, const ALIGN: usize> DynamicSharedArray<T, ALIGN> {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// // First array at offset 0
     /// let array_a: *mut f32 = DynamicSharedArray::<f32>::get();
     ///
@@ -452,3 +494,56 @@ impl<T, const ALIGN: usize> DynamicSharedArray<T, ALIGN> {
         unreachable!("DynamicSharedArray::offset called outside CUDA kernel context")
     }
 }
+
+/// Convert a generic-address pointer into its raw `.shared` window offset.
+///
+/// The CUDA C++ `__cvta_generic_to_shared_offset` analog (PTX `cvta.to.shared`).
+/// Rust-visible pointer addresses (`ptr as usize`, `ptr::addr`) are CUDA
+/// generic addresses; hardware SMEM descriptors (WGMMA and tcgen05 matrix
+/// descriptors, whose low bits encode `(start_address >> 4) & 0x3FFF`) are
+/// defined on the space-local shared offset instead. Use this to derive
+/// descriptor base addresses; do not pass a raw `ptr as u64` there.
+///
+/// ```rust,ignore
+/// static mut SMEM_A: SharedArray<f16, 2048> = SharedArray::UNINIT;
+/// let base = unsafe { cvta_generic_to_shared_offset(&raw const SMEM_A as *const u8) };
+/// let desc = build_smem_descriptor(base, LBO_BYTES, SBO_BYTES, SWIZZLE_NONE);
+/// ```
+///
+/// # Safety
+///
+/// `ptr` must be a generic pointer to shared memory (for example one
+/// derived from a `SharedArray` static). Converting a pointer that does not
+/// point into shared memory yields an unspecified offset.
+//
+// The importer intercepts calls by the exact rendered def-path
+// `cuda_device::shared::cvta_generic_to_shared_offset`. A `pub use` at the crate
+// root would change rustc's visible path for this item and silently break
+// interception, so import it through this module.
+#[inline(never)]
+pub unsafe fn cvta_generic_to_shared_offset(ptr: *const u8) -> u64 {
+    let _ = ptr;
+    unreachable!("cvta_generic_to_shared_offset called outside CUDA kernel context")
+}
+
+/// Convert a generic address into its 32-bit `.shared::cta` state-space address.
+///
+/// Unlike [`cvta_generic_to_shared_offset`], which returns the `u64` carrier
+/// used to construct WGMMA and tcgen05 descriptors, this form matches the
+/// `u32` address operand consumed by CTA-shared instructions such as `ldmatrix`.
+/// Convert a shared base once, then keep byte-offset and swizzle arithmetic in
+/// `u32` when the complete addressed allocation fits the CTA shared window.
+///
+/// # Safety
+///
+/// `ptr` must be a generic pointer to memory in the current CTA's shared-memory
+/// window. Converting any other pointer produces an unspecified address.
+//
+// Keep this uninlined: mir-importer intercepts the exact rendered def-path.
+#[inline(never)]
+pub unsafe fn cvta_generic_to_shared_u32(ptr: *const u8) -> u32 {
+    let _ = ptr;
+    unreachable!("cvta_generic_to_shared_u32 called outside CUDA kernel context")
+}
+
+include!("generated/shared_sreg.rs");

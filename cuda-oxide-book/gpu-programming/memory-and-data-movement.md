@@ -20,6 +20,7 @@ latency, and scope:
 | **Registers**              | Per thread  | ~255 × 32-bit                | 0 cycles         | Local variables                      |
 | **Shared memory**          | Per block   | 48--228 KB (arch-dependent)  | ~5 cycles        | `SharedArray`, `DynamicSharedArray`  |
 | **L1 cache**               | Per SM      | Combined with shared         | Hardware-managed | Automatic                            |
+| **Constant memory**        | All threads | 64 KB, read-only on device   | Broadcast-cached | `ConstantMemory` via `#[constant]`   |
 | **L2 cache**               | Chip-wide   | Up to 50 MB (Hopper)         | ~30 cycles       | Automatic                            |
 | **Global memory (DRAM)**   | All threads | 16--80 GB (HBM)              | ~400 cycles      | `DeviceBuffer`, `DeviceBox`          |
 
@@ -113,7 +114,7 @@ let results = c_dev.to_host_vec(&stream).unwrap();
 
 | Method                            | Direction     | Description                    |
 |:--------------------------------- |:--------------|:-------------------------------|
-| `from_host(&stream, &[T])`        | Host → Device | Allocate + async copy          |
+| `from_host(&stream, &[T])`        | Host → Device | Allocate + blocking copy       |
 | `zeroed(&stream, len)`            | --            | Allocate + zero-fill           |
 | `to_host_vec(&stream)`            | Device → Host | Async copy + return `Vec<T>`   |
 | `copy_to_host(&stream, &mut [T])` | Device → Host | Copy into existing slice       |
@@ -147,8 +148,8 @@ and executes only after all preceding work on that stream completes. Critically,
 it does **not** synchronize the device:
 
 ```rust
-use cuda_async::device_box::DeviceBox;
-use cuda_async::device_context::init_device_contexts;
+use cuda_async::simt::device_box::DeviceBox;
+use cuda_async::simt::device_context::init_device_contexts;
 
 init_device_contexts(0, 1)?;  // Initialize device context map (default device 0)
 
@@ -222,10 +223,11 @@ prevents two threads from writing to the same location.
 
 cuda-oxide provides `DisjointSlice<T, IndexSpace>` as a safe alternative. It
 wraps a mutable slice and only allows writes through a `ThreadIndex` whose
-`IndexSpace` matches its own, ensuring each thread accesses a unique element:
+`IndexSpace` matches its own. Combined with matching prepared launch geometry,
+this ensures each thread accesses a unique element:
 
 ```rust
-use cuda_device::{kernel, DisjointSlice};
+use cuda_device::{DisjointSlice, kernel};
 
 #[kernel]
 pub fn double(input: &[f32], mut out: DisjointSlice<f32>) {
@@ -264,6 +266,17 @@ warp scheduler. For 1D grid launches (where only the x dimension is used), the
 global index derived from `blockIdx.x * blockDim.x + threadIdx.x` is unique
 across the entire grid.
 
+That last statement is conditional: `index_1d()` ignores Y and Z. A 2D grid
+would repeat the same X-derived index for every Y coordinate.
+
+```text
+PreparedLaunch(domain=1) -> Y/Z inactive -> safe DisjointSlice writes
+raw LaunchConfig         -> caller proves Y/Z inactive -> unsafe launch
+```
+
+The witness proves the device-side index space; the prepared launch proves the
+host-side geometry. Both are needed for a fully safe launch.
+
 The witness is also `!Send + !Sync + !Copy + !Clone`, and its `'kernel`
 lifetime is borrowed from a stack-local scope the macros inject -- so a
 thread can't park its `ThreadIndex` in shared memory for a neighbour to
@@ -284,7 +297,7 @@ in both speed and scope.
 When the size is known at compile time, use `SharedArray<T, N>`:
 
 ```rust
-use cuda_device::{kernel, thread, SharedArray, DisjointSlice};
+use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 
 static mut TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
 
@@ -321,7 +334,7 @@ When the size depends on runtime parameters, use `DynamicSharedArray<T>` and
 specify the allocation size via `LaunchConfig::shared_mem_bytes`:
 
 ```rust
-use cuda_device::{kernel, thread, DynamicSharedArray, DisjointSlice};
+use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, thread};
 
 #[kernel]
 pub fn dynamic_smem_example(input: &[f32], mut out: DisjointSlice<f32>) {
@@ -366,6 +379,92 @@ Multiple dynamic arrays can share the same allocation by using
 :::{seealso}
 [CUDA Programming Guide -- Shared Memory](https://docs.nvidia.com/cuda/cuda-programming-guide/#shared-memory)
 for details on bank conflicts, broadcasting, and optimal access patterns.
+:::
+
+## Constant memory -- `#[constant]`
+
+Constant memory is a small, read-only window the host writes between launches
+and every thread in the grid reads. It is served by a cache built for
+**broadcast**: when all lanes of a warp want the same address it is one
+transaction, and when they want different addresses those are served in
+sequence.
+
+Declare it as a `static` inside a `#[cuda_module]`:
+
+```rust
+#[cuda_module]
+mod kernels {
+    use cuda_device::{ConstantMemory, DisjointSlice, constant, kernel, thread};
+
+    #[constant]
+    static SCALE: ConstantMemory<f32> = ConstantMemory::UNINIT;
+
+    #[kernel]
+    pub fn multiply(mut out: DisjointSlice<f32>) {
+        let s = SCALE.get();
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(e) = out.get_mut(idx) {
+            *e = (i as f32) * s;
+        }
+    }
+}
+```
+
+The macro generates two host setters per constant, named `set_` plus the
+static's name lowercased, so `SCALE` becomes `set_scale` and `TABLE_CONST`
+becomes `set_table_const`. The plain form is stream-ordered; a
+`set_<name>_blocking` sibling does a synchronous one-shot copy instead:
+
+```rust
+let module = kernels::load(&ctx)?;
+module.set_scale(&stream, &3.0)?;
+```
+
+`ConstantMemory<T>` accepts `T: ConstantMemoryValue`, an unsafe marker
+implemented for the primitive integers and floats, `*const T` / `*mut T`,
+tuples up to eight elements, and arrays of those. The requirement it encodes is
+that an all-zero bit pattern is a valid `T`, since `ConstantMemory::UNINIT`
+starts out zeroed -- which is why references and `NonZero*` types are excluded,
+and why a custom struct needs an explicit `#[repr(C)]` layout before opting in.
+
+### `get()` versus `get_ref()`
+
+This is the one thing worth knowing before using it for anything but a scalar.
+
+`get()` returns a by-value copy. A value has no address, so indexing a
+`ConstantMemory<[f32; N]>` copy at a runtime index forces the whole array to be
+spilled to the thread's local depot first -- one store per element, in *every*
+thread -- and the lookup then reads thread-private memory. `get_ref()` borrows
+the storage instead, so the index stays in constant space and the read is a
+single `ld.const`.
+
+The `constant_memory_table` example measures both against the third option, a
+plain `const T: [f32; N]` materialized as an immutable device global. Measured
+on an A10G (sm_86), 256-entry `f32` table, 64 dependent lookups per thread
+over 8388608 threads, all variants bit-identical:
+
+| index        | `get()` | `get_ref()` | `const [f32; N]` (global) |
+|:-------------|--------:|------------:|--------------------------:|
+| divergent    | 16048us |      7616us |                 **322us** |
+| warp-uniform | 16065us |   **258us** |                     322us |
+
+Two conclusions. `get_ref` is worth 2.1x over `get` on a divergent index and
+62x on a warp-uniform one, so prefer it for anything larger than a scalar. And
+constant memory is not simply "faster memory": on a divergent index it is 23.7x
+*behind* an ordinary array constant, because a warp's divergent reads of a small
+table coalesce and stay resident in L1 while the constant cache serves the
+distinct addresses in sequence. Reach for `#[constant]` when the index is
+warp-uniform; reach for a plain `const` array when it is not.
+
+Reads are not folded away across launches: the `UnsafeCell` interior keeps the
+storage mutable as far as the compiler is concerned, so a `set_<name>` between
+launches stays visible. Repeated reads of one entry *within* a launch may still
+be merged, which is sound, because the host only writes between launches.
+
+:::{seealso}
+[CUDA Programming Guide -- `__constant__`](https://docs.nvidia.com/cuda/cuda-programming-guide/#constant)
+for the hardware limits and caching rules this maps onto.
 :::
 
 ## Unified memory and HMM
@@ -426,7 +525,8 @@ without a special CUDA allocator:
 ```rust
 let factor = 5i32;                           // ordinary stack variable
 let scale = |x: i32| x * factor;            // captures &factor (non-move)
-cuda_launch! { kernel: scale, args: [...] }  // GPU reads &factor via HMM
+// SAFETY: args match the kernel's signature; &factor stays alive via HMM.
+unsafe { cuda_launch! { kernel: scale, args: [...] } }  // GPU reads &factor via HMM
 ```
 
 Unlike Unified Memory, HMM requires no special allocation API -- the pointer is

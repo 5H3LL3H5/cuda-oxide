@@ -36,8 +36,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use cuda_core::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig};
-use cuda_host::cuda_launch;
+use cuda_core::simt::LaunchConfig;
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use hashbrown::HashMap as HbMap;
 use hashmap_v2::*;
 use rayon::prelude::*;
@@ -96,13 +96,13 @@ unsafe fn reset_table_async(
     stream: &Arc<CudaStream>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
-        cuda_core::memory::memset_d8_async(
+        cuda_core::simt::memory::memset_d8_async(
             map.ctrl.cu_deviceptr(),
             0xFF,
             map.ctrl.num_bytes(),
             stream.cu_stream(),
         )?;
-        cuda_core::memory::memset_d8_async(
+        cuda_core::simt::memory::memset_d8_async(
             map.slots.cu_deviceptr(),
             0xFF,
             map.slots.num_bytes(),
@@ -262,7 +262,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
-    let module: Arc<CudaModule> = ctx.load_module_from_file("hashmap_v2.ptx")?;
+    // The device artifact is embedded in this binary, so the bench needs no
+    // loose `hashmap_v2.ptx` beside the manifest -- the same load `main.rs`
+    // already uses.
+    let module = kernels::load(&ctx)?;
 
     print_environment_banner(&ctx)?;
 
@@ -320,37 +323,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cfg = LaunchConfig::for_num_elems(n_keys as u32);
         row_b_insert[col_idx] =
             bench_gpu_insert(&map, &keys_dev, &values_dev, n_keys, &stream, |m, k, v| {
-                cuda_launch! {
-                    kernel: insert_kernel,
-                    stream: stream,
-                    module: module,
-                    config: cfg,
-                    args: [slice(m.ctrl), slice(m.slots), slice(*k), slice(*v)]
-                }?;
+                // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+                unsafe { module.insert_kernel(&stream, cfg, &m.ctrl, &m.slots, k, v) }?;
                 Ok(())
             })?;
 
         // ---- GPU INSERT — Protocol A -----------------------------------
         row_a_insert[col_idx] =
             bench_gpu_insert(&map, &keys_dev, &values_dev, n_keys, &stream, |m, k, v| {
-                cuda_launch! {
-                    kernel: insert_kernel_proto_a,
-                    stream: stream,
-                    module: module,
-                    config: cfg,
-                    args: [slice(m.ctrl), slice(m.slots), slice(*k), slice(*v)]
-                }?;
+                // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+                unsafe { module.insert_kernel_proto_a(&stream, cfg, &m.ctrl, &m.slots, k, v) }?;
                 Ok(())
             })?;
 
         // ---- Build a final B-protocol map for the find benches ----------
         unsafe { reset_table_async(&map, &stream)? };
-        cuda_launch! {
-            kernel: insert_kernel,
-            stream: stream,
-            module: module,
-            config: cfg,
-            args: [slice(map.ctrl), slice(map.slots), slice(keys_dev), slice(values_dev)]
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe {
+            module.insert_kernel(&stream, cfg, &map.ctrl, &map.slots, &keys_dev, &values_dev)
         }?;
         stream.synchronize()?;
 
@@ -359,38 +349,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ---- GPU LOOKUP (hits) — single-thread --------------------------
         row_single_lookup[col_idx] =
             bench_gpu_find(&map, &keys_dev, &mut out_dev, n_keys, &stream, |m, k, o| {
-                cuda_launch! {
-                    kernel: find_kernel,
-                    stream: stream,
-                    module: module,
-                    config: cfg,
-                    args: [slice(m.ctrl), slice(m.slots), slice(*k), slice_mut(*o)]
-                }?;
+                // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+                unsafe { module.find_kernel(&stream, cfg, &m.ctrl, &m.slots, k, o) }?;
                 Ok(())
             })?;
 
         // ---- GPU LOOKUP (hits) — warp-cooperative -----------------------
         row_warp_lookup[col_idx] =
             bench_gpu_find(&map, &keys_dev, &mut out_dev, n_keys, &stream, |m, k, o| {
-                cuda_launch! {
-                    kernel: find_kernel_warp,
-                    stream: stream,
-                    module: module,
-                    config: cfg_warp,
-                    args: [slice(m.ctrl), slice(m.slots), slice(*k), slice_mut(*o)]
-                }?;
+                // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+                unsafe { module.find_kernel_warp(&stream, cfg_warp, &m.ctrl, &m.slots, k, o) }?;
                 Ok(())
             })?;
 
         // ---- GPU LOOKUP (hits) — warp-cooperative, typed CG API ---------
         row_warp_typed_lookup[col_idx] =
             bench_gpu_find(&map, &keys_dev, &mut out_dev, n_keys, &stream, |m, k, o| {
-                cuda_launch! {
-                    kernel: find_kernel_warp_typed,
-                    stream: stream,
-                    module: module,
-                    config: cfg_warp,
-                    args: [slice(m.ctrl), slice(m.slots), slice(*k), slice_mut(*o)]
+                // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+                unsafe {
+                    module.find_kernel_warp_typed(&stream, cfg_warp, &m.ctrl, &m.slots, k, o)
                 }?;
                 Ok(())
             })?;
@@ -403,13 +380,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             n_keys,
             &stream,
             |m, k, o| {
-                cuda_launch! {
-                    kernel: find_kernel,
-                    stream: stream,
-                    module: module,
-                    config: cfg,
-                    args: [slice(m.ctrl), slice(m.slots), slice(*k), slice_mut(*o)]
-                }?;
+                // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+                unsafe { module.find_kernel(&stream, cfg, &m.ctrl, &m.slots, k, o) }?;
                 Ok(())
             },
         )?;
@@ -422,13 +394,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             n_keys,
             &stream,
             |m, k, o| {
-                cuda_launch! {
-                    kernel: find_kernel_warp,
-                    stream: stream,
-                    module: module,
-                    config: cfg_warp,
-                    args: [slice(m.ctrl), slice(m.slots), slice(*k), slice_mut(*o)]
-                }?;
+                // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+                unsafe { module.find_kernel_warp(&stream, cfg_warp, &m.ctrl, &m.slots, k, o) }?;
                 Ok(())
             },
         )?;
@@ -441,12 +408,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             n_keys,
             &stream,
             |m, k, o| {
-                cuda_launch! {
-                    kernel: find_kernel_warp_typed,
-                    stream: stream,
-                    module: module,
-                    config: cfg_warp,
-                    args: [slice(m.ctrl), slice(m.slots), slice(*k), slice_mut(*o)]
+                // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+                unsafe {
+                    module.find_kernel_warp_typed(&stream, cfg_warp, &m.ctrl, &m.slots, k, o)
                 }?;
                 Ok(())
             },

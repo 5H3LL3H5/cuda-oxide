@@ -59,7 +59,7 @@ sets up the scheduling policy (round-robin with four streams by default), and
 makes the thread-local state available for `.sync()` and `.await`:
 
 ```rust
-use cuda_async::device_context::init_device_contexts;
+use cuda_async::simt::device_context::init_device_contexts;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -118,7 +118,7 @@ work yet) and hand it to `tokio::spawn`:
         let pipeline = zip!(h2d(batch_data), zeros(DIM * DIM), zeros(DIM))
             .and_then(move |(input, hidden, output)| {
                 // Stage 1: GEMM — hidden = input × W0
-                // ... build AsyncKernelLaunch, push args, chain with and_then ...
+                // ... build + finalize an owned launch, then chain with and_then ...
             })
             .and_then(move |(hidden, output, w1, module)| {
                 // Stage 2: MatVec — output = hidden × W1

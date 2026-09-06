@@ -24,7 +24,8 @@
 //!
 //! Once array index writes are implemented, all tests should pass.
 
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
+use cuda_core::simt::LaunchConfig;
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_module;
 use std::sync::Arc;
@@ -311,9 +312,7 @@ fn main() {
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context");
     println!("Device ordinal: {}\n", ctx.ordinal());
 
-    let ptx_path = concat!(env!("CARGO_MANIFEST_DIR"), "/array_index.ptx");
-
-    let module = match ctx.load_module_from_file(ptx_path) {
+    let module = match kernels::load(&ctx) {
         Ok(m) => m,
         Err(e) => {
             println!("Failed to load PTX: {}", e);
@@ -325,7 +324,6 @@ fn main() {
             return;
         }
     };
-    let module = kernels::from_module(module).expect("Failed to initialize typed CUDA module");
 
     let stream = ctx.default_stream();
 
@@ -363,8 +361,8 @@ fn run_test_const_index_read(
         shared_mem_bytes: 0,
     };
 
-    module
-        .test_const_index_read((stream).as_ref(), config, &mut d_out)
+    // SAFETY: this test launches exactly one thread for one output element.
+    unsafe { module.test_const_index_read((stream).as_ref(), config, &mut d_out) }
         .expect("Kernel launch failed");
 
     let result = d_out.to_host_vec(stream).unwrap()[0];
@@ -391,8 +389,8 @@ fn run_test_const_index_read_expr(
         shared_mem_bytes: 0,
     };
 
-    module
-        .test_const_index_read_expr((stream).as_ref(), config, &mut d_out)
+    // SAFETY: this test launches exactly one thread for one output element.
+    unsafe { module.test_const_index_read_expr((stream).as_ref(), config, &mut d_out) }
         .expect("Kernel launch failed");
 
     let result = d_out.to_host_vec(stream).unwrap()[0];
@@ -420,8 +418,9 @@ fn run_test_runtime_index_read(
     };
 
     let index = 2u32; // Read arr[2] = 300
-    module
-        .test_runtime_index_read((stream).as_ref(), config, index, &mut d_out)
+    // SAFETY: this test launches exactly one thread, and `index` selects a
+    // valid element of the kernel's four-element local array.
+    unsafe { module.test_runtime_index_read((stream).as_ref(), config, index, &mut d_out) }
         .expect("Kernel launch failed");
 
     let result = d_out.to_host_vec(stream).unwrap()[0];
@@ -448,8 +447,8 @@ fn run_test_runtime_index_read_loop(
         shared_mem_bytes: 0,
     };
 
-    module
-        .test_runtime_index_read_loop((stream).as_ref(), config, &mut d_out)
+    // SAFETY: this test launches exactly one thread for one output element.
+    unsafe { module.test_runtime_index_read_loop((stream).as_ref(), config, &mut d_out) }
         .expect("Kernel launch failed");
 
     let result = d_out.to_host_vec(stream).unwrap()[0];
@@ -477,8 +476,9 @@ fn run_test_mixed_read(
     };
 
     let index = 2u32; // arr[2] = 30
-    module
-        .test_mixed_read((stream).as_ref(), config, index, &mut d_out)
+    // SAFETY: this test launches exactly one thread, and `index` selects a
+    // valid element of the kernel's four-element local array.
+    unsafe { module.test_mixed_read((stream).as_ref(), config, index, &mut d_out) }
         .expect("Kernel launch failed");
 
     let result = d_out.to_host_vec(stream).unwrap()[0];
@@ -506,7 +506,8 @@ fn run_test_const_index_write(
     };
 
     let val = 5u32;
-    match module.test_const_index_write((stream).as_ref(), config, val, &mut d_out) {
+    // SAFETY: this test launches exactly one thread for one output element.
+    match unsafe { module.test_const_index_write((stream).as_ref(), config, val, &mut d_out) } {
         Ok(_) => {
             let result = d_out.to_host_vec(stream).unwrap()[0];
             let expected = 26u32; // 5 + 6 + 7 + 8
@@ -537,7 +538,8 @@ fn run_test_runtime_index_write_loop(
         shared_mem_bytes: 0,
     };
 
-    match module.test_runtime_index_write_loop((stream).as_ref(), config, &mut d_out) {
+    // SAFETY: this test launches exactly one thread for one output element.
+    match unsafe { module.test_runtime_index_write_loop((stream).as_ref(), config, &mut d_out) } {
         Ok(_) => {
             let result = d_out.to_host_vec(stream).unwrap()[0];
             let expected = 280u32; // 0+10+20+30+40+50+60+70
@@ -573,7 +575,11 @@ fn run_test_copy_to_local_array(
         shared_mem_bytes: 0,
     };
 
-    match module.test_copy_to_local_array((stream).as_ref(), config, &d_input, &mut d_out) {
+    // SAFETY: one thread reads the four-element input and writes the single
+    // output element allocated above.
+    match unsafe {
+        module.test_copy_to_local_array((stream).as_ref(), config, &d_input, &mut d_out)
+    } {
         Ok(_) => {
             let result = d_out.to_host_vec(stream).unwrap()[0];
             let expected = 1000u32; // 100+200+300+400
@@ -607,7 +613,8 @@ fn run_test_read_modify_write(
         shared_mem_bytes: 0,
     };
 
-    match module.test_read_modify_write((stream).as_ref(), config, &mut d_out) {
+    // SAFETY: this test launches exactly one thread for one output element.
+    match unsafe { module.test_read_modify_write((stream).as_ref(), config, &mut d_out) } {
         Ok(_) => {
             let result = d_out.to_host_vec(stream).unwrap()[0];
             let expected = 20u32; // 2+4+6+8

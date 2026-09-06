@@ -1,10 +1,17 @@
 # The cuda-oxide Book
 
-```{image} _static/images/logo.png
-:alt: cuda-oxide logo
+```{image} _static/images/banner-light.png
+:alt: cuda-oxide: write CUDA (SIMT) kernels in pure Rust
 :align: center
-:width: 780px
-:class: mb-4
+:width: 640px
+:class: only-light mb-4
+```
+
+```{image} _static/images/banner-dark.png
+:alt: cuda-oxide: write CUDA (SIMT) kernels in pure Rust
+:align: center
+:width: 640px
+:class: only-dark mb-4
 ```
 
 **cuda-oxide** is an experimental Rust-to-CUDA compiler that lets you write (SIMT) GPU kernels in safe(ish), idiomatic Rust. It compiles standard Rust code directly to PTX — no DSLs, no foreign language bindings, just Rust.
@@ -26,15 +33,18 @@ The v0.1.0 release is an early-stage alpha: **expect bugs, incomplete features, 
 ## 🚀 Quick start
 
 ```rust
-use cuda_device::{cuda_module, kernel, thread, DisjointSlice};
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig1D};
+use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
+use cuda_host::cuda_module;
 
 #[cuda_module]
 mod kernels {
     use super::*;
 
     #[kernel]
-    fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, block = (256, 1, 1))]
+    pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
         let idx = thread::index_1d();
         let i = idx.get();
         if let Some(c_elem) = c.get_mut(idx) {
@@ -46,14 +56,19 @@ mod kernels {
 fn main() {
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
-    let module = kernels::load(&ctx).unwrap();
+
+    // SAFETY: this package owns the embedded device bundle for `kernels`.
+    let module = unsafe { kernels::load(&ctx).unwrap() };
 
     let a = DeviceBuffer::from_host(&stream, &[1.0f32; 1024]).unwrap();
     let b = DeviceBuffer::from_host(&stream, &[2.0f32; 1024]).unwrap();
     let mut c = DeviceBuffer::<f32>::zeroed(&stream, 1024).unwrap();
 
+    let prepared = module
+        .prepare_vecadd(LaunchConfig1D::new(1024u32.div_ceil(256), 256, 0))
+        .unwrap();
     module
-        .vecadd(&stream, LaunchConfig::for_num_elems(1024), &a, &b, &mut c)
+        .vecadd(&stream, &prepared, &a, &b, &mut c)
         .unwrap();
 
     let result = c.to_host_vec(&stream).unwrap();
@@ -61,13 +76,18 @@ fn main() {
 }
 ```
 
-Build and run with `cargo oxide run vecadd` upon installing the [prerequisites](getting-started/installation.md).
+Build and run with `cargo oxide run vecadd` upon installing the [prerequisites](getting-started/installation.md). The same launch-contract pattern is what `cargo oxide new` scaffolds; see [Writing Your First Kernel](getting-started/hello-gpu.md).
 
 :::{note}
 `#[cuda_module]` embeds the generated device artifact into the host binary and
 generates a typed `kernels::load` function plus one launch method per kernel.
-The lower-level `load_kernel_module` and `cuda_launch!` APIs remain available
-when you need to load a specific sidecar artifact or build custom launch code.
+Kernel arguments are type-checked. A declared `#[launch_contract]` unlocks the
+safe `PreparedLaunch` path (`prepare_*` + typed launch) described in
+[Launching Kernels](gpu-programming/launching-kernels.md). A raw `LaunchConfig`
+call remains available as an unsafe escape hatch when you need a one-off
+geometry that the contract does not cover. The lower-level
+`load_kernel_module` and unsafe `cuda_launch!` APIs remain available when you
+need to load a specific sidecar artifact or build custom launch code.
 :::
 
 ---
@@ -112,7 +132,9 @@ getting-started/hello-gpu
 gpu-programming/execution-model
 gpu-programming/kernels-and-device-functions
 gpu-programming/memory-and-data-movement
+gpu-programming/virtual-memory-and-peer-access
 gpu-programming/launching-kernels
+gpu-programming/kernel-families
 gpu-programming/closures-and-generics
 gpu-programming/error-handling-and-debugging
 ```
@@ -123,6 +145,7 @@ gpu-programming/error-handling-and-debugging
 :caption: Safety on the GPU
 
 gpu-safety/the-safety-model
+gpu-safety/bounds-checks
 ```
 
 ```{toctree}
@@ -134,6 +157,7 @@ async-programming/the-device-operation-model
 async-programming/combinators-and-composition
 async-programming/scheduling-and-streams
 async-programming/concurrent-execution
+async-programming/overlapping-transfers-and-compute
 ```
 
 ```{toctree}
@@ -166,9 +190,11 @@ compiler/pliron
 compiler/rustc-public
 compiler/rustc-codegen-cuda
 compiler/mir-importer
+compiler/compiler-optimizations
 compiler/mlir-dialects
 compiler/lowering-pipeline
 compiler/adding-new-intrinsics
+compiler/catalog-generated-intrinsics
 compiler/fuzzing-and-differential-testing
 ```
 

@@ -40,6 +40,12 @@ unsafe extern "C" {
     fn warp_reduce_sum(val: f32) -> f32;
     fn warp_ballot(predicate: i32) -> u32;
     fn simple_add(a: f32, b: f32) -> f32;
+    // `char` is a plain 32-bit device-extern slot. Rust still warns because C
+    // has no native `char` equivalent, so acknowledge that contract here.
+    #[allow(improper_ctypes)]
+    fn char_to_upper(c: char) -> char;
+    #[allow(improper_ctypes)]
+    fn char_store(output: *mut char, c: char);
     fn clamp_value(val: f32, min_val: f32, max_val: f32) -> f32;
     fn smem_write_aligned_128(offset: i32, value: f32);
     fn smem_read_aligned_128(offset: i32) -> f32;
@@ -88,6 +94,21 @@ mod kernels {
         if tid.is_multiple_of(32) {
             unsafe {
                 *output.add((tid / 32) as usize) = sum;
+            }
+        }
+    }
+
+    /// Round-trip a `char` through an external CUDA `unsigned int` function.
+    #[kernel]
+    pub fn test_char_ffi(output: *mut u32) {
+        let tid = cuda_device::thread::threadIdx_x();
+        if tid == 0 {
+            let upper = unsafe { char_to_upper('q') };
+            let unchanged = unsafe { char_to_upper('Z') };
+            unsafe {
+                *output = upper as u32;
+                *output.add(1) = unchanged as u32;
+                char_store(output.add(2).cast::<char>(), 'λ');
             }
         }
     }
@@ -316,8 +337,24 @@ fn build_tools(example_dir: &Path) -> Result<(), String> {
     let tools_dir = example_dir.join("tools");
     let compile_ltoir = tools_dir.join("compile_ltoir");
     let link_ltoir = tools_dir.join("link_ltoir");
+    let compile_source = tools_dir.join("compile_ltoir.c");
+    let link_source = tools_dir.join("link_ltoir.c");
+    let options_header = tools_dir.join("compile_options.h");
+    let build_script = tools_dir.join("build_tools.sh");
 
-    if compile_ltoir.exists() && link_ltoir.exists() {
+    let compile_sources = [
+        compile_source.as_path(),
+        options_header.as_path(),
+        build_script.as_path(),
+    ];
+    let link_sources = [
+        link_source.as_path(),
+        options_header.as_path(),
+        build_script.as_path(),
+    ];
+    if !file_needs_rebuild(&compile_ltoir, &compile_sources)
+        && !file_needs_rebuild(&link_ltoir, &link_sources)
+    {
         return Ok(());
     }
 
@@ -380,6 +417,7 @@ fn build_external_ltoir(example_dir: &Path) -> Result<(), String> {
 /// `cargo oxide run device_ffi_test --emit-nvvm-ir --arch=<your_arch>`  (e.g., sm_120)
 fn compile_cuda_oxide_ltoir(example_dir: &Path) -> Result<(), String> {
     let ll_file = example_dir.join("device_ffi_test.ll");
+    let options_file = example_dir.join("device_ffi_test.options");
     let ltoir_file = example_dir.join("device_ffi_test.ltoir");
     let tools_dir = example_dir.join("tools");
 
@@ -392,7 +430,7 @@ fn compile_cuda_oxide_ltoir(example_dir: &Path) -> Result<(), String> {
         ));
     }
 
-    if !file_needs_rebuild(&ltoir_file, &[&ll_file]) {
+    if !file_needs_rebuild(&ltoir_file, &[&ll_file, &options_file]) {
         return Ok(());
     }
 
@@ -473,7 +511,8 @@ fn build_pipeline() -> Result<std::path::PathBuf, String> {
 // Uses cuda-driver to load the merged cubin, launch kernels, and verify results.
 // =============================================================================
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::simt::LaunchConfig;
+use cuda_core::{CudaContext, DeviceBuffer};
 use std::sync::Arc;
 
 /// Main entry point - builds the pipeline and runs GPU tests.
@@ -509,6 +548,7 @@ fn main() {
     let mut tests_failed = 0;
 
     test_simple_device_funcs_runner(&ctx, &module, &mut tests_passed, &mut tests_failed);
+    test_char_ffi_runner(&ctx, &module, &mut tests_passed, &mut tests_failed);
     test_cub_warp_reduce_runner(&ctx, &module, &mut tests_passed, &mut tests_failed);
     test_mixed_attrs_runner(&ctx, &module, &mut tests_passed, &mut tests_failed);
     test_smem_alignment_cross_module_runner(&ctx, &module, &mut tests_passed, &mut tests_failed);
@@ -563,13 +603,15 @@ fn test_simple_device_funcs_runner(
         shared_mem_bytes: 0,
     };
 
-    module
-        .test_simple_device_funcs(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_simple_device_funcs(
             (stream).as_ref(),
             config,
             d_output.cu_deviceptr() as *mut f32,
         )
-        .expect("Kernel launch failed");
+    }
+    .expect("Kernel launch failed");
 
     let h_output = d_output.to_host_vec(&stream).unwrap();
 
@@ -594,6 +636,48 @@ fn test_simple_device_funcs_runner(
         *passed += 1;
     } else {
         println!("    ✗ FAILED ({} errors)", errors);
+        *failed += 1;
+    }
+}
+
+/// Test: `char` across a `#[device]` extern boundary.
+fn test_char_ffi_runner(
+    ctx: &Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    passed: &mut i32,
+    failed: &mut i32,
+) {
+    println!("--- Test: test_char_ffi ---");
+
+    let stream = ctx.default_stream();
+    let d_output = DeviceBuffer::<u32>::zeroed(&stream, 3).unwrap();
+    let config = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // SAFETY: the launch writes exactly three 32-bit values into d_output.
+    unsafe {
+        module.test_char_ffi(
+            (stream).as_ref(),
+            config,
+            d_output.cu_deviceptr() as *mut u32,
+        )
+    }
+    .expect("Kernel launch failed");
+
+    let actual = d_output.to_host_vec(&stream).unwrap();
+    let expected = [u32::from('Q'), u32::from('Z'), u32::from('λ')];
+    if actual[..3] == expected {
+        println!("    ✓ PASSED ('q' -> 'Q', 'Z' unchanged, pointer -> 'λ')");
+        *passed += 1;
+    } else {
+        println!(
+            "    ✗ FAILED (got {:?}, expected {:?})",
+            &actual[..3],
+            expected
+        );
         *failed += 1;
     }
 }
@@ -625,14 +709,16 @@ fn test_cub_warp_reduce_runner(
         shared_mem_bytes: 0,
     };
 
-    module
-        .test_cub_warp_reduce(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_cub_warp_reduce(
             (stream).as_ref(),
             config,
             d_input.cu_deviceptr() as *const f32,
             d_output.cu_deviceptr() as *mut f32,
         )
-        .expect("Kernel launch failed");
+    }
+    .expect("Kernel launch failed");
 
     let h_output = d_output.to_host_vec(&stream).unwrap();
 
@@ -686,8 +772,9 @@ fn test_mixed_attrs_runner(
         shared_mem_bytes: 0,
     };
 
-    module
-        .test_mixed_attrs(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_mixed_attrs(
             (stream).as_ref(),
             config,
             d_a.cu_deviceptr() as *const f32,
@@ -695,7 +782,8 @@ fn test_mixed_attrs_runner(
             d_output.cu_deviceptr() as *mut f32,
             vec_size,
         )
-        .expect("Kernel launch failed");
+    }
+    .expect("Kernel launch failed");
 
     let h_output = d_output.to_host_vec(&stream).unwrap();
 
@@ -736,13 +824,15 @@ fn test_smem_alignment_cross_module_runner(
         shared_mem_bytes: 256, // Enough for the test
     };
 
-    module
-        .test_smem_alignment_cross_module(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.test_smem_alignment_cross_module(
             (stream).as_ref(),
             config,
             d_output.cu_deviceptr() as *mut u64,
         )
-        .expect("Kernel launch failed");
+    }
+    .expect("Kernel launch failed");
 
     // Synchronize to flush printf output
     stream.synchronize().expect("Sync failed");

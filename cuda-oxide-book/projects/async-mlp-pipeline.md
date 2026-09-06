@@ -76,8 +76,8 @@ The `Cargo.toml` pulls in exactly the crates we need:
 ```toml
 [dependencies]
 cuda-device   = { path = "../../../cuda-device" }       # #[kernel], DisjointSlice, thread::*
-cuda-core = { path = "../../../cuda-core" }      # CudaModule, LaunchConfig
-cuda-async  = { path = "../../../cuda-async" }       # DeviceOperation, zip!, and_then, spawn
+cuda-core     = "0.3.1"                                 # shared with cutile-rs: CudaModule, simt::LaunchConfig
+cuda-async    = "0.3.1"                                 # shared with cutile-rs: simt::DeviceOperation, zip!, and_then
 tokio       = { version = "1", features = ["rt", "macros"] }
 ```
 
@@ -99,7 +99,7 @@ them.
 ### sgemm_naive — matrix multiply
 
 ```rust
-use cuda_device::{kernel, thread, DisjointSlice};
+use cuda_device::{DisjointSlice, kernel, thread};
 
 use cuda_device::thread::Runtime2DIndex;
 
@@ -109,14 +109,14 @@ pub fn sgemm_naive(
     alpha: f32, a: &[f32], b: &[f32],
     beta: f32, mut c: DisjointSlice<f32, Runtime2DIndex>,
 ) {
-    let n_sz = n as usize;
     let row = thread::index_2d_row();
     let col = thread::index_2d_col();
 
-    // SAFETY: every thread sees the same `n_sz` (same kernel arg).
-    if let Some(c_idx) = unsafe { thread::index_2d_runtime(n_sz) } {
-        // col < n_sz guaranteed by `Some` -- no manual check needed
+    // The row width comes from `c`, bound on the host to this same `n`.
+    if let Some(c_idx) = thread::index_2d_runtime(&c) {
+        // col < n guaranteed by `Some` -- no manual check needed
         if row < m as usize {
+            let n_sz = n as usize;
             let k_sz = k as usize;
             let mut sum = 0.0f32;
             let mut i = 0usize;
@@ -133,9 +133,12 @@ pub fn sgemm_naive(
 ```
 
 Each thread computes one element of the output matrix. The 2D thread index
-maps directly to the (row, col) position. `DisjointSlice<f32>` is the safe
-mutable view — it guarantees at compile time that each thread writes to a
-distinct element, so no data race, no `unsafe`.
+maps directly to the (row, col) position. `DisjointSlice` checks bounds and
+requires the matching index-space type. `c`'s row width is not a per-call
+argument: the host binds it into the slice once at launch, and
+`index_2d_runtime(&c)` reads it back, so every thread resolves against the
+same row width by construction. The remaining proof is explicit: Z is
+inactive and the raw 2D launch shape matches the kernel.
 
 :::{tip}
 This is intentionally a *naive* GEMM — one thread, one element, no shared
@@ -187,7 +190,7 @@ pub fn relu(input: &[f32], mut output: DisjointSlice<f32>) {
 
 Elementwise `max(0, x)`. In the pipeline, `input` and `output` point to the
 same buffer — a perfectly valid in-place pattern since each thread reads and
-writes the same index.
+writes the same index and the launch is 1D.
 
 ### What to notice
 
@@ -196,7 +199,7 @@ A few patterns that recur across all three kernels:
 | Pattern                                   | What it does                                                                                               |
 | :---------------------------------------- | :----------------------------------------------------------------------------------------------------------|
 | `thread::index_1d()` / `index_2d::<S>()`  | Computes the global thread index from block/grid dimensions                                                |
-| `DisjointSlice<f32>`                      | Safe mutable output — compiler guarantees no aliasing                                                      |
+| `DisjointSlice<f32>`                      | Bounds-checked mutable output; launch geometry completes the uniqueness proof                              |
 | `if let Some(elem) = slice.get_mut(idx)`  | Bounds check that silences threads beyond the data size                                                    |
 | `while` loops instead of `for`            | Stylistic choice — `for` loops with ranges also work on device, but `while` makes the loop bounds explicit |
 
@@ -336,43 +339,61 @@ copies.
 This is where the magic lives. For each batch, we build a four-stage chain:
 
 ```rust
+    use cuda_async::simt::launch::{AsyncKernelLaunchBuilder, OwnedAsyncKernelLaunch};
+
     let pipeline = zip!(h2d(batch_data), zeros(DIM * DIM), zeros(DIM))
         .and_then(move |(input, hidden, output)| {
             // Stage 1: GEMM — hidden = input @ W0
             let func = module.load_function("sgemm_naive").unwrap();
-            let mut launch = AsyncKernelLaunch::new(Arc::new(func));
-            launch.push_args((
+            let mut builder = AsyncKernelLaunchBuilder::new(Arc::new(func));
+            builder.push_args((
                 DIM as u32, DIM as u32, DIM as u32,
                 1.0f32,
                 input.cu_deviceptr(), input.len() as u64,
                 w0.cu_deviceptr(), w0.len() as u64,
                 0.0f32,
                 hidden.cu_deviceptr(), hidden.len() as u64,
-            )).set_launch_config(gemm_cfg);
-            launch.and_then(move |()| value((hidden, output, w1, module)))
+                DIM as u32,  // hidden's row width: the third packet word a
+                             // DisjointSlice<_, Runtime2DIndex> takes
+            ));
+            // SAFETY: packet/config match sgemm_naive (including the width
+            // word for `c`), the scheduler uses the module's context, and the
+            // owned wrapper retains its allocations.
+            let launch = unsafe { builder.finalize_unchecked(gemm_cfg) };
+            let launch = OwnedAsyncKernelLaunch::new(launch, (input, w0, hidden));
+            launch.and_then(move |(_input, _w0, hidden)| {
+                value((hidden, output, w1, module))
+            })
         })
         .and_then(move |(hidden, output, w1, module)| {
             // Stage 2: MatVec — output = hidden @ W1
             let func = module.load_function("matvec_naive").unwrap();
-            let mut launch = AsyncKernelLaunch::new(Arc::new(func));
-            launch.push_args((
+            let mut builder = AsyncKernelLaunchBuilder::new(Arc::new(func));
+            builder.push_args((
                 DIM as u32, DIM as u32,
                 hidden.cu_deviceptr(), hidden.len() as u64,
                 w1.cu_deviceptr(), w1.len() as u64,
                 output.cu_deviceptr(), output.len() as u64,
-            )).set_launch_config(matvec_cfg);
-            launch.and_then(move |()| value((output, module)))
+            ));
+            // SAFETY: packet/config match matvec_naive, the scheduler uses the
+            // module's context, and the owned wrapper retains its allocations.
+            let launch = unsafe { builder.finalize_unchecked(matvec_cfg) };
+            let launch = OwnedAsyncKernelLaunch::new(launch, (hidden, w1, output));
+            launch.and_then(move |(_hidden, _w1, output)| value((output, module)))
         })
         .and_then(move |(output, module)| {
             // Stage 3: ReLU — result = max(0, output)
             let func = module.load_function("relu").unwrap();
             let relu_out: DeviceBox<[f32]> = output;
-            let mut launch = AsyncKernelLaunch::new(Arc::new(func));
-            launch.push_args((
+            let mut builder = AsyncKernelLaunchBuilder::new(Arc::new(func));
+            builder.push_args((
                 relu_out.cu_deviceptr(), relu_out.len() as u64,
                 relu_out.cu_deviceptr(), relu_out.len() as u64,
-            )).set_launch_config(relu_cfg);
-            launch.and_then(move |()| value(relu_out))
+            ));
+            // SAFETY: packet/config match relu, the scheduler uses the module's
+            // context, and the owned wrapper retains output.
+            let launch = unsafe { builder.finalize_unchecked(relu_cfg) };
+            OwnedAsyncKernelLaunch::new(launch, relu_out)
         })
         .and_then(d2h);
 ```
@@ -403,6 +424,14 @@ required for `zip!` to work.
 **In-place ReLU.** Stage 3 passes `relu_out` as both `input` and `output`
 to the kernel. Since each thread reads `input[idx]` and writes `output[idx]`
 at the same index, this is safe — no thread reads another's write.
+
+**Raw launch boundary.** The builder is inert. `finalize_unchecked` is where
+the raw packet and geometry become runnable, so each call has a local safety
+proof. `OwnedAsyncKernelLaunch` keeps its buffers alive. Prefer generated
+owned-async methods with `PreparedLaunch<K>` when the kernel declares a launch
+contract; for a runtime-width output like `c`, the generated method takes
+`cuda_host::RowWidthOwned::new(buffer, width)` and marshals the third packet
+word for you.
 
 ### Step 4: Spawn and collect
 
